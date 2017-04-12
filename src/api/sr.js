@@ -48,6 +48,28 @@ scan.resolve = {
 
 // -------------------------------------------------------------------
 
+export async function stats ({SR, granularity}) {
+  await this.getXapiSrStats(SR, granularity)
+}
+
+stats.description = 'returns statistics about the VM'
+
+stats.params = {
+  id: { type: 'string' },
+  granularity: {
+    type: 'string',
+    optional: true
+  }
+}
+
+stats.resolve = {
+  vm: ['id', ['SR'], 'view']
+}
+
+exports.stats = stats
+
+// -------------------------------------------------------------------
+
 // TODO: find a way to call this "delete" and not destroy
 export async function destroy ({ sr }) {
   const xapi = this.getXapi(sr)

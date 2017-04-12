@@ -49,10 +49,10 @@ scan.resolve = {
 // -------------------------------------------------------------------
 
 export async function stats ({SR, granularity}) {
-  await this.getXapiSrStats(SR, granularity)
+  return this.getXapiSrStats(SR, granularity)
 }
 
-stats.description = 'returns statistics about the VM'
+stats.description = 'returns statistics about the SR'
 
 stats.params = {
   id: { type: 'string' },

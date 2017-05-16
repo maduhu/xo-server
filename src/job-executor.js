@@ -7,7 +7,6 @@ import isArray from 'lodash/isArray'
 import isPlainObject from 'lodash/isPlainObject'
 import map from 'lodash/map'
 import mapValues from 'lodash/mapValues'
-import moment from 'moment-timezone'
 import size from 'lodash/size'
 import some from 'lodash/some'
 import { BaseError } from 'make-error'
@@ -152,7 +151,8 @@ export default class JobExecutor {
 
     const execStatus = {
       runJobId,
-      start: moment.tz(timezone),
+      start: Date.now(),
+      timezone,
       calls: {}
     }
 
@@ -167,7 +167,7 @@ export default class JobExecutor {
       const call = execStatus.calls[runCallId] = {
         method: job.method,
         params,
-        start: moment.tz(timezone)
+        start: Date.now()
       }
       let promise = this.xo.callApiMethod(connection, job.method, assign({}, params))
       if (job.timeout) {
@@ -184,7 +184,7 @@ export default class JobExecutor {
           })
 
           call.returnedValue = value
-          call.end = moment.tz(timezone)
+          call.end = Date.now()
         },
         reason => {
           this._logger.notice(`Call ${job.method} (${runCallId}) has failed. (${job.id})`, {
@@ -195,7 +195,7 @@ export default class JobExecutor {
           })
 
           call.error = reason
-          call.end = moment.tz(timezone)
+          call.end = Date.now()
         }
       )
     }, {
@@ -203,7 +203,7 @@ export default class JobExecutor {
     })
 
     connection.close()
-    execStatus.end = moment.tz(timezone)
+    execStatus.end = Date.now()
 
     return execStatus
   }

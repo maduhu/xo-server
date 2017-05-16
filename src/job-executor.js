@@ -2,10 +2,12 @@ import assign from 'lodash/assign'
 import Bluebird from 'bluebird'
 import every from 'lodash/every'
 import filter from 'lodash/filter'
+import find from 'lodash/find'
 import isArray from 'lodash/isArray'
 import isPlainObject from 'lodash/isPlainObject'
 import map from 'lodash/map'
 import mapValues from 'lodash/mapValues'
+import moment from 'moment-timezone'
 import size from 'lodash/size'
 import some from 'lodash/some'
 import { BaseError } from 'make-error'
@@ -146,9 +148,11 @@ export default class JobExecutor {
 
     connection.set('user_id', job.userId)
 
+    const { timezone } = find(await this.xo.getAllSchedules(), ['job', job.id])
+
     const execStatus = {
       runJobId,
-      start: Date.now(),
+      start: moment.tz(timezone),
       calls: {}
     }
 
@@ -163,7 +167,7 @@ export default class JobExecutor {
       const call = execStatus.calls[runCallId] = {
         method: job.method,
         params,
-        start: Date.now()
+        start: moment.tz(timezone)
       }
       let promise = this.xo.callApiMethod(connection, job.method, assign({}, params))
       if (job.timeout) {
@@ -180,7 +184,7 @@ export default class JobExecutor {
           })
 
           call.returnedValue = value
-          call.end = Date.now()
+          call.end = moment.tz(timezone)
         },
         reason => {
           this._logger.notice(`Call ${job.method} (${runCallId}) has failed. (${job.id})`, {
@@ -191,7 +195,7 @@ export default class JobExecutor {
           })
 
           call.error = reason
-          call.end = Date.now()
+          call.end = moment.tz(timezone)
         }
       )
     }, {
@@ -199,7 +203,7 @@ export default class JobExecutor {
     })
 
     connection.close()
-    execStatus.end = Date.now()
+    execStatus.end = moment.tz(timezone)
 
     return execStatus
   }

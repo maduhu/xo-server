@@ -147,13 +147,13 @@ export default class JobExecutor {
 
     connection.set('user_id', job.userId)
 
-    const { timezone } = find(await this.xo.getAllSchedules(), ['job', job.id])
+    const schedule = find(await this.xo.getAllSchedules(), { job: job.id })
 
     const execStatus = {
+      calls: {},
       runJobId,
       start: Date.now(),
-      timezone,
-      calls: {}
+      timezone: schedule !== undefined ? schedule.timezone : undefined
     }
 
     await Bluebird.map(paramsFlatVector, params => {

@@ -48,6 +48,21 @@ scan.resolve = {
 
 // -------------------------------------------------------------------
 
+export async function detectUnheathlyChain ({ sr }) {
+  const xapi = this.getXapi(sr)
+  return xapi.getUnHealthyVdiChains(sr)
+}
+
+detectUnheathlyChain.params = {
+  id: { type: 'string' }
+}
+
+detectUnheathlyChain.resolve = {
+  sr: ['id', 'SR', 'operate']
+}
+
+// -------------------------------------------------------------------
+
 // TODO: find a way to call this "delete" and not destroy
 export async function destroy ({ sr }) {
   const xapi = this.getXapi(sr)

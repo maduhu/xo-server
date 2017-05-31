@@ -1,4 +1,3 @@
-import arp from 'arp-a'
 import createLogger from 'debug'
 import defer from 'golike-defer'
 import execa from 'execa'
@@ -14,7 +13,6 @@ import {
 
 import {
   asyncMap,
-  pFromCallback,
   splitFirst
 } from '../utils'
 
@@ -29,24 +27,35 @@ const XOSAN_MAX_DISK_SIZE = 2093050 * 1024 * 1024 // a bit under 2To
 
 const CURRENTLY_CREATING_SRS = {}
 
-export async function getVolumeInfo ({ sr }) {
-  const xapi = this.getXapi(sr)
-  const giantIPtoVMDict = {}
+function _getIPToVMDict (xapi, sr) {
+  const dict = {}
+  dict.vmForBrick = brick => {
+    return dict[brick.split(':')[0]]
+  }
+  const data = xapi.xo.getData(sr, 'xosan_config')
+  if (data && data.nodes) {
+    const nodes = data.nodes
+    nodes.forEach(conf => {
+      try {
+        dict[conf.vm.ip] = xapi.getObject(conf.vm.id)
+      } catch (e) {
+        // pass
+      }
+    })
+  }
+  return dict
+}
+
+async function _getVolumeInfo (xapi, sr) {
+  const giantIPtoVMDict = _getIPToVMDict(xapi, sr)
   const data = xapi.xo.getData(sr, 'xosan_config')
   if (!data || !data.nodes) {
     return null
   }
   const nodes = data.nodes
-  nodes.forEach(conf => {
-    giantIPtoVMDict[conf.vm.ip] = xapi.getObject(conf.vm.id)
-  })
   const oneHostAndVm = nodes[0]
-  const resultCmd = await remoteSsh(xapi, {
-    host: xapi.getObject(oneHostAndVm.host),
-    address: oneHostAndVm.vm.ip
-  }, 'gluster volume info xosan')
-  const result = resultCmd['stdout']
-
+  const hostAndAddress = {host: xapi.getObject(oneHostAndVm.host), address: oneHostAndVm.vm.ip}
+  const infoText = (await remoteSsh(xapi, hostAndAddress, 'gluster volume info xosan'))['stdout']
   /*
    Volume Name: xosan
    Type: Disperse
@@ -79,7 +88,7 @@ export async function getVolumeInfo ({ sr }) {
    cluster.quorum-type: auto
    */
   const info = fromPairs(
-    splitLines(result.trim()).map(line =>
+    splitLines(infoText.trim()).map(line =>
       splitFirst(line, ':').map(val => val.trim())
     )
   )
@@ -90,17 +99,19 @@ export async function getVolumeInfo ({ sr }) {
   // expected brickKeys : [ 'Brick1', 'Brick2', 'Brick3' ]
   info['Bricks'] = brickKeys.map(key => {
     const ip = info[key].split(':')[0]
-    return { config: info[key], ip: ip, vm: giantIPtoVMDict[ip] }
+    const vm = giantIPtoVMDict.vmForBrick(info[key])
+    return { config: info[key].split(' ')[0], brickLabel: info[key], ip: ip, vmId: vm ? vm.$id : null, vmLabel: vm ? vm.name_label : null }
   })
-  const entry = await pFromCallback(cb => arp.table(cb))
-  if (entry) {
-    const brick = info['Bricks'].find(element => element.config.split(':')[0] === entry.ip)
-    if (brick) {
-      brick.mac = entry.mac
-    }
+  for (let key of brickKeys) {
+    delete info[key]
   }
-
   return info
+}
+
+export async function getVolumeInfo ({ sr }) {
+  const xapi = this.getXapi(sr)
+  const info = await _getVolumeInfo(xapi, sr)
+  return { info }
 }
 
 getVolumeInfo.description = 'info on gluster volume'
@@ -132,7 +143,15 @@ async function prepareGlusterVm (xapi, vmAndParam, xosanNetwork, increaseDataDis
   const host = sr.$PBDs[0].$host
   const firstVif = vm.$VIFs[0]
   if (xosanNetwork.$id !== firstVif.$network.$id) {
-    await xapi.call('VIF.move', firstVif.$ref, xosanNetwork.$ref)
+    try {
+      await xapi.call('VIF.move', firstVif.$ref, xosanNetwork.$ref)
+    } catch (error) {
+      if (error.code === 'MESSAGE_METHOD_UNKNOWN') {
+        // VIF.move has been introduced in xenserver 7.0
+        await xapi.deleteVif(firstVif.$id)
+        await xapi.createVif(vm.$id, xosanNetwork.$id, firstVif)
+      }
+    }
   }
   await xapi.editVm(vm, {
     name_label: params.name_label,

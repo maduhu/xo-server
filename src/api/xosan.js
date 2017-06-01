@@ -1,19 +1,17 @@
 import createLogger from 'debug'
 import defer from 'golike-defer'
 import execa from 'execa'
-import fromPairs from 'lodash/fromPairs'
 import fs from 'fs-extra'
 import map from 'lodash/map'
-import splitLines from 'split-lines'
 import { tap } from 'promise-toolbox'
 import {
-  filter,
-  includes
+  includes,
+  clone
 } from 'lodash'
 
 import {
   asyncMap,
-  splitFirst
+  parseXml
 } from '../utils'
 
 const debug = createLogger('xo:xosan')
@@ -30,6 +28,7 @@ const CURRENTLY_CREATING_SRS = {}
 function _getIPToVMDict (xapi, sr) {
   const dict = {}
   dict.vmForBrick = brick => {
+    // IPV6
     return dict[brick.split(':')[0]]
   }
   const data = xapi.xo.getData(sr, 'xosan_config')
@@ -55,56 +54,21 @@ async function _getVolumeInfo (xapi, sr) {
   const nodes = data.nodes
   const oneHostAndVm = nodes[0]
   const glusterEndpoint = { xapi, host: xapi.getObject(oneHostAndVm.host), address: oneHostAndVm.vm.ip }
-  const infoText = (await remoteSsh(glusterEndpoint, 'gluster volume info xosan'))['stdout']
-  /*
-   Volume Name: xosan
-   Type: Disperse
-   Volume ID: 1d4d0e57-8b6b-43f9-9d40-c48be1df7548
-   Status: Started
-   Snapshot Count: 0
-   Number of Bricks: 1 x (2 + 1) = 3
-   Transport-type: tcp
-   Bricks:
-   Brick1: 192.168.0.201:/bricks/brick1/xosan1
-   Brick2: 192.168.0.202:/bricks/brick1/xosan1
-   Brick3: 192.168.0.203:/bricks/brick1/xosan1
-   Options Reconfigured:
-   client.event-threads: 16
-   server.event-threads: 16
-   performance.client-io-threads: on
-   nfs.disable: on
-   performance.readdir-ahead: on
-   transport.address-family: inet
-   features.shard: on
-   features.shard-block-size: 64MB
-   network.remote-dio: enable
-   cluster.eager-lock: enable
-   performance.io-cache: off
-   performance.read-ahead: off
-   performance.quick-read: off
-   performance.stat-prefetch: on
-   performance.strict-write-ordering: off
-   cluster.server-quorum-type: server
-   cluster.quorum-type: auto
-   */
-  const info = fromPairs(
-    splitLines(infoText.trim()).map(line =>
-      splitFirst(line, ':').map(val => val.trim())
-    )
-  )
-
-  const getNumber = item => +item.substr(5)
-  const brickKeys = filter(Object.keys(info), key => key.match(/^Brick[1-9]/)).sort((i1, i2) => getNumber(i1) - getNumber(i2))
-
-  // expected brickKeys : [ 'Brick1', 'Brick2', 'Brick3' ]
-  info['Bricks'] = brickKeys.map(key => {
-    const ip = info[key].split(':')[0]
-    const vm = giantIPtoVMDict.vmForBrick(info[key])
-    return { config: info[key].split(' ')[0], brickLabel: info[key], ip: ip, vmId: vm ? vm.$id : null, vmLabel: vm ? vm.name_label : null }
+  const xml = (await remoteSsh(glusterEndpoint, 'gluster --xml volume info xosan'))['stdout']
+  const parsedXml = parseXml(xml)
+  const volume = parsedXml['cliOutput']['volInfo']['volumes']['volume']
+  const optionsArray = volume['options']['option']
+  const info = clone(volume)
+  delete info['options']
+  delete info['bricks']
+  optionsArray.forEach(option => { info[option.name] = option.value })
+  info['Bricks'] = volume['bricks']['brick'].map(brick => {
+    const name = brick['name']
+    // IPV6
+    const ip = name.split(':')[0]
+    const vm = giantIPtoVMDict.vmForBrick(name)
+    return { uuid: brick['uuid'], isArbiter: brick['isArbiter'] === '1', brickLabel: name, ip: ip, vmId: vm ? vm.$id : null, vmLabel: vm ? vm.name_label : null }
   })
-  for (let key of brickKeys) {
-    delete info[key]
-  }
   return info
 }
 
@@ -240,7 +204,7 @@ async function configureGluster (redundancy, ipAndHosts, xapi, firstIpAndHost, g
     },
     replica: {
       creation: 'replica ' + redundancy + ' ',
-      extra: ['gluster volume set xosan cluster.data-self-heal on']
+      extra: ['gluster --mode=script --xml volume set xosan cluster.data-self-heal on']
     },
     disperse: {
       creation: 'disperse ' + ipAndHosts.length + ' redundancy ' + redundancy + ' ',
@@ -249,29 +213,29 @@ async function configureGluster (redundancy, ipAndHosts, xapi, firstIpAndHost, g
   }
   let brickVms = arbiter ? ipAndHosts.concat(arbiter) : ipAndHosts
   for (let i = 1; i < brickVms.length; i++) {
-    await remoteSsh(glusterEndpoint, 'gluster peer probe ' + brickVms[i].address)
+    await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer probe ' + brickVms[i].address)
   }
   const creation = configByType[glusterType].creation
-  const volumeCreation = 'gluster volume create xosan ' + creation +
+  const volumeCreation = 'gluster --mode=script --xml volume create xosan ' + creation +
     ' ' + brickVms.map(ipAndHost => _getBrickName(ipAndHost.address)).join(' ')
   debug('creating volume: ', volumeCreation)
   await remoteSsh(glusterEndpoint, volumeCreation)
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan network.remote-dio enable')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan cluster.eager-lock enable')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan performance.io-cache off')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan performance.read-ahead off')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan performance.quick-read off')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan performance.strict-write-ordering off')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan client.event-threads 8')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan server.event-threads 8')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan performance.io-thread-count 64')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan performance.stat-prefetch on')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan features.shard on')
-  await remoteSsh(glusterEndpoint, 'gluster volume set xosan features.shard-block-size 512MB')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan network.remote-dio enable')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan cluster.eager-lock enable')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.io-cache off')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.read-ahead off')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.quick-read off')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.strict-write-ordering off')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan client.event-threads 8')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan server.event-threads 8')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.io-thread-count 64')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.stat-prefetch on')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan features.shard on')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan features.shard-block-size 512MB')
   for (const confChunk of configByType[glusterType].extra) {
     await remoteSsh(glusterEndpoint, confChunk)
   }
-  await remoteSsh(glusterEndpoint, 'gluster volume start xosan')
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume start xosan')
 }
 
 export const createSR = defer.onFailure(async function ($onFailure, { template, pif, vlan, srs, glusterType, redundancy }) {

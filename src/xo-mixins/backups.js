@@ -3,7 +3,7 @@ import escapeStringRegexp from 'escape-string-regexp'
 import eventToPromise from 'event-to-promise'
 import execa from 'execa'
 import splitLines from 'split-lines'
-import { CancelToken, ignoreErrors } from 'promise-toolbox'
+import { cancelable, CancelToken, ignoreErrors } from 'promise-toolbox'
 import { createParser as createPairsParser } from 'parse-pairs'
 import { createReadStream, readdir, stat } from 'fs'
 import { satisfies as versionSatisfies } from 'semver'
@@ -303,7 +303,7 @@ const mountLvmPv = (device, partition) => {
 
 // ===================================================================
 
-export default class {
+export default class Backups {
   constructor (xo) {
     this._xo = xo
 
@@ -377,12 +377,13 @@ export default class {
     return backups
   }
 
-  async importVmBackup (remoteId, file, sr) {
+  @cancelable
+  async importVmBackup ($cancelToken, remoteId, file, sr) {
     const handler = await this._xo.getRemoteHandler(remoteId)
     const stream = await handler.createReadStream(file)
     const xapi = this._xo.getXapi(sr)
 
-    const vm = await xapi.importVm(stream, { srId: sr._xapiId })
+    const vm = await xapi.importVm($cancelToken, stream, { srId: sr._xapiId })
 
     const { datetime } = parseVmBackupPath(file)
     await Promise.all([
@@ -397,8 +398,9 @@ export default class {
 
   // -----------------------------------------------------------------
 
+  @cancelable
   @deferrable.onFailure
-  async deltaCopyVm ($onFailure, srcVm, targetSr) {
+  async deltaCopyVm ($onFailure, $cancelToken, srcVm, targetSr) {
     const srcXapi = this._xo.getXapi(srcVm)
     const targetXapi = this._xo.getXapi(targetSr)
 
@@ -418,12 +420,11 @@ export default class {
     // 2. Copy.
     let size = 0
     const dstVm = await (async () => {
-      const { cancel, token } = CancelToken.source()
+      $cancelToken = $cancelToken.fork($onfailure)
       const delta = await srcXapi.exportDeltaVm(token, srcVm.$id, localBaseUuid, {
         snapshotNameLabel: `XO_DELTA_EXPORT: ${targetSr.name_label} (${targetSr.uuid})`
       })
       $onFailure(() => srcXapi.deleteVm(delta.vm.uuid))
-      $onFailure(cancel)
 
       delta.vm.name_label += ` (${shortDate(Date.now())})`
 
@@ -436,6 +437,7 @@ export default class {
       })
 
       const promise = targetXapi.importDeltaVm(
+        $cancelToken,
         delta,
         {
           deleteBase: true, // Remove the remote base.
@@ -742,8 +744,9 @@ export default class {
     }
   }
 
+  @cancelable
   @deferrable.onFailure
-  async rollingDeltaVmBackup ($onFailure, {vm, remoteId, tag, retention}) {
+  async rollingDeltaVmBackup ($onFailure, $cancelToken, {vm, remoteId, tag, retention}) {
     const handler = await this._xo.getRemoteHandler(remoteId)
     const xapi = this._xo.getXapi(vm)
 
@@ -778,21 +781,20 @@ export default class {
     )
 
     // Export...
-    const { cancel, token } = CancelToken.source()
-    const delta = await xapi.exportDeltaVm(token, vm.$id, baseVm && baseVm.$id, {
+    $cancelToken = CancelToken.fork($onFailure)
+    const delta = await xapi.exportDeltaVm($cancelToken, vm.$id, baseVm && baseVm.$id, {
       snapshotNameLabel: `XO_DELTA_BASE_VM_SNAPSHOT_${tag}`,
       fullVdisRequired,
       disableBaseTags: true
     })
     $onFailure(() => xapi.deleteVm(delta.vm.uuid))
-    $onFailure(cancel)
 
     // Save vdis.
     const vdiBackups = await pSettle(
       mapToArray(delta.vdis, async (vdi, key) => {
         const vdiParent = xapi.getObject(vdi.snapshot_of)
 
-        return this._saveDeltaVdiBackup(xapi, {
+        return this._saveDeltaVdiBackup($cancelToken, xapi, {
           vdiParent,
           isFull: !baseVm || find(fullVdisRequired, id => vdiParent.$id === id),
           handler,
@@ -817,7 +819,7 @@ export default class {
     // One or many vdi backups have failed.
     for (const vdiBackup of vdiBackups) {
       if (vdiBackup.isFulfilled()) {
-        fulFilledVdiBackups.push(vdiBackup)
+        fulFilledVdiBackups.push(vdiBackup.value())
       } else {
         error = vdiBackup.reason()
         console.error('Rejected backup:', error)
@@ -825,7 +827,7 @@ export default class {
     }
 
     $onFailure(() => asyncMap(fulFilledVdiBackups, vdiBackup =>
-      handler.unlink(`${dir}/${vdiBackup.value()}`)::ignoreErrors()
+      handler.unlink(`${dir}/${vdiBackup}`)
     ))
 
     if (error) {
@@ -846,10 +848,10 @@ export default class {
     // Here we have a completed backup. We can merge old vdis.
     await Promise.all(
       mapToArray(vdiBackups, vdiBackup => {
-        const backupName = vdiBackup.value().path
+        const backupName = vdiBackup.path
         const backupDirectory = backupName.slice(0, backupName.lastIndexOf('/'))
         const backupDir = `${dir}/${backupDirectory}`
-        dataSize += vdiBackup.value().size
+        dataSize += vdiBackup.size
 
         return this._mergeDeltaVdiBackups({ handler, dir: backupDir, retention })
           .then(() => { this._chainDeltaVdiBackups({ handler, dir: backupDir }) })
@@ -870,7 +872,8 @@ export default class {
     }
   }
 
-  async importDeltaVmBackup ({sr, remoteId, filePath, mapVdisSrs = {}}) {
+  @cancelable
+  async importDeltaVmBackup ($cancelToken, {sr, remoteId, filePath, mapVdisSrs = {}}) {
     filePath = `${filePath}${DELTA_BACKUP_EXT}`
     const { datetime } = parseVmBackupPath(filePath)
 
@@ -890,24 +893,22 @@ export default class {
       const basePath = dirname(filePath)
       const streams = delta.streams = {}
 
-      await Promise.all(
-        mapToArray(
-          delta.vdis,
-          async (vdi, id) => {
-            const vdisFolder = `${basePath}/${dirname(vdi.xoPath)}`
-            const backups = await this._listDeltaVdiDependencies(handler, `${basePath}/${vdi.xoPath}`)
+      await asyncMap(delta.vdis, async (vdi, id) => {
+        const vdisFolder = `${basePath}/${dirname(vdi.xoPath)}`
+        const backups = await this._listDeltaVdiDependencies(handler, `${basePath}/${vdi.xoPath}`)
 
-            streams[`${id}.vhd`] = await Promise.all(mapToArray(backups, async backup =>
-              handler.createReadStream(`${vdisFolder}/${backup}`, { checksum: true, ignoreMissingChecksum: true })
-            ))
-          }
+        streams[`${id}.vhd`] = await asyncMap(backups, backup =>
+          handler.createReadStream(`${vdisFolder}/${backup}`, {
+            checksum: true,
+            ignoreMissingChecksum: true
+          })
         )
-      )
+      })
 
       delta.vm.name_label += ` (${shortDate(datetime * 1e3)})`
       delta.vm.tags.push('restored from backup')
 
-      vm = await xapi.importDeltaVm(delta, {
+      vm = await xapi.importDeltaVm($cancelToken, delta, {
         disableStartAfterImport: false,
         srId: sr !== undefined && sr._xapiId,
         mapVdisSrs
@@ -921,16 +922,17 @@ export default class {
 
   // -----------------------------------------------------------------
 
-  async backupVm ({vm, remoteId, file, compress, onlyMetadata}) {
+  @cancelable
+  async backupVm ($cancelToken, {vm, remoteId, file, compress, onlyMetadata}) {
     const handler = await this._xo.getRemoteHandler(remoteId)
-    return this._backupVm(vm, handler, file, {compress, onlyMetadata})
+    return this._backupVm($cancelToken, vm, handler, file, {compress, onlyMetadata})
   }
 
-  async _backupVm (vm, handler, file, {compress, onlyMetadata}) {
+  async _backupVm ($cancelToken, vm, handler, file, {compress, onlyMetadata}) {
     const targetStream = await handler.createOutputStream(file)
     const promise = eventToPromise(targetStream, 'finish')
 
-    const sourceStream = await this._xo.getXapi(vm).exportVm(vm._xapiId, {
+    const sourceStream = await this._xo.getXapi(vm).exportVm($cancelToken, vm._xapiId, {
       compress,
       onlyMetadata: onlyMetadata || false
     })
@@ -948,7 +950,8 @@ export default class {
     }
   }
 
-  async rollingBackupVm ({vm, remoteId, tag, retention, compress, onlyMetadata}) {
+  @cancelable
+  async rollingBackupVm ($cancelToken, {vm, remoteId, tag, retention, compress, onlyMetadata}) {
     const handler = await this._xo.getRemoteHandler(remoteId)
 
     const files = await handler.list()
@@ -959,7 +962,7 @@ export default class {
     const date = safeDateFormat(new Date())
     const file = `${date}_${tag}_${vm.name_label}.xva`
 
-    const data = await this._backupVm(vm, handler, file, {compress, onlyMetadata})
+    const data = await this._backupVm($cancelToken, vm, handler, file, {compress, onlyMetadata})
     await this._removeOldBackups(backups, handler, undefined, backups.length - (retention - 1))
 
     return data
@@ -990,7 +993,8 @@ export default class {
     ))
   }
 
-  async rollingDrCopyVm ({vm, sr, tag, retention, deleteOldBackupsFirst}) {
+  @cancelable
+  async rollingDrCopyVm ($cancelToken, {vm, sr, tag, retention, deleteOldBackupsFirst}) {
     tag = 'DR_' + tag
     const reg = new RegExp('^' + escapeStringRegexp(`${vm.name_label}_${tag}_`) + '[0-9]{8}T[0-9]{6}Z$')
 
@@ -1019,13 +1023,13 @@ export default class {
     }
 
     const copyName = `${vm.name_label}_${tag}_${safeDateFormat(new Date())}`
-    const data = await sourceXapi.remoteCopyVm(vm.$id, targetXapi, sr.$id, {
+    const data = await sourceXapi.remoteCopyVm($cancelToken, vm.$id, targetXapi, sr.$id, {
       nameLabel: copyName
     })
 
     targetXapi._updateObjectMapProperty(data.vm, 'blocked_operations', {
       start: 'Start operation for this vm is blocked, clone it if you want to use it.'
-    })
+    })::ignoreErrors()
 
     await targetXapi.addTag(data.vm.$id, 'Disaster Recovery')
 

@@ -12,6 +12,7 @@ import {
   find,
   filter,
   flatten,
+  groupBy,
   includes,
   isEmpty,
   omit,
@@ -777,26 +778,30 @@ export default class Xapi extends XapiBase {
     })
   }
 
-  _assertHealthyVdiChain (vdi) {
-    if (vdi === null) {
+  _assertHealthyVdiChain (vdi, childrenMap) {
+    if (vdi == null) {
       return
     }
 
     if (!vdi.managed) {
-      let n = 0
-      const { uuid } = vdi
-      forEach(vdi.$SR.$VDIs, vdi => {
-        if (vdi.sm_config['vhd-parent'] === uuid && ++n > 1) {
-          return false // no need to continue, more than 1 child
-        }
-      })
-      if (n === 1) {
+      if (childrenMap === undefined) {
+        childrenMap = groupBy(vdi.$SR.$VDIs, _ => _.sm_config['vhd-parent'])
+      }
+
+      // an unmanaged VDI should not have exactly one child: they
+      // should coalesce
+      const children = childrenMap[vdi.uuid]
+      if (
+        children.length === 1 &&
+        !children[0].managed // some SRs do not coalesce the leaf
+      ) {
         throw new Error('unhealthy VDI chain')
       }
     }
 
     this._assertHealthyVdiChain(
-      this.getObjectByUuid(vdi.sm_config['vhd-parent'], null)
+      this.getObjectByUuid(vdi.sm_config['vhd-parent'], null),
+      childrenMap
     )
   }
 
@@ -2166,16 +2171,16 @@ export default class Xapi extends XapiBase {
 
   // Create VDI on an adequate local SR
   async createTemporaryVdiOnHost (stream, hostId, name_label, name_description) {
-    const sr = find(
+    const pbd = find(
       this.getObject(hostId).$PBDs,
       pbd => canSrHaveNewVdiOfSize(pbd.$SR, stream.length)
     )
 
-    if (sr == null) {
+    if (pbd == null) {
       throw new Error('no SR available')
     }
 
-    return this.createTemporaryVdiOnSr(stream, sr, name_label, name_description)
+    return this.createTemporaryVdiOnSr(stream, pbd.SR, name_label, name_description)
   }
 
   async findAvailableSharedSr (minSize) {

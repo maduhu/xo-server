@@ -1,4 +1,4 @@
-import createJsonSchemaValidator from 'is-my-json-valid'
+import Ajv from 'ajv'
 
 import { PluginsMetadata } from '../models/plugin-metadata'
 import {
@@ -15,6 +15,9 @@ import {
 
 export default class {
   constructor (xo) {
+    this._ajv = new Ajv({
+      useDefaults: true
+    })
     this._plugins = createRawObject()
 
     this._pluginsMetadata = new PluginsMetadata({
@@ -87,23 +90,17 @@ export default class {
       })
     }
 
-    // Configure plugin if necessary. (i.e. configurationSchema)
-    // Load plugin.
-    // Ignore configuration and loading errors.
-    Promise.resolve()
-      .then(() => {
-        if (!plugin.configured) {
-          return this._configurePlugin(plugin, configuration)
-        }
-      })
-      .then(() => {
-        if (autoload) {
-          return this.loadPlugin(id)
-        }
-      })
-      .catch(error => {
-        console.error('register plugin %s: %s', name, (error && error.stack) || error)
-      })
+    if (configurationSchema !== undefined) {
+      if (configuration === undefined) {
+        return
+      }
+
+      await this._configurePlugin(plugin, configuration)
+    }
+
+    if (autoload) {
+      await this.loadPlugin(id)
+    }
   }
 
   async _getPlugin (id) {
@@ -153,15 +150,7 @@ export default class {
       throw invalidParameters('plugin not configurable')
     }
 
-    // See: https://github.com/mafintosh/is-my-json-valid/issues/116
-    if (configuration == null) {
-      throw invalidParameters([{
-        field: 'data',
-        message: 'is the wrong type'
-      }])
-    }
-
-    const validate = createJsonSchemaValidator(configurationSchema)
+    const validate = this._ajv.compile(configurationSchema)
     if (!validate(configuration)) {
       throw invalidParameters(validate.errors)
     }
@@ -249,7 +238,7 @@ export default class {
         }])
       }
 
-      const validate = createJsonSchemaValidator(testSchema)
+      const validate = this._ajv.compile(testSchema)
       if (!validate(data)) {
         throw invalidParameters(validate.errors)
       }

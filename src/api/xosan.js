@@ -6,7 +6,8 @@ import map from 'lodash/map'
 import { tap } from 'promise-toolbox'
 import {
   includes,
-  clone
+  forOwn,
+  isArray
 } from 'lodash'
 
 import {
@@ -45,37 +46,55 @@ function _getIPToVMDict (xapi, sr) {
   return dict
 }
 
-async function _getVolumeInfo (xapi, sr) {
-  const giantIPtoVMDict = _getIPToVMDict(xapi, sr)
+function _getGlusterEndpoint (xapi, sr) {
   const data = xapi.xo.getData(sr, 'xosan_config')
   if (!data || !data.nodes) {
     return null
   }
-  const nodes = data.nodes
-  const oneHostAndVm = nodes[0]
-  const glusterEndpoint = { xapi, host: xapi.getObject(oneHostAndVm.host), address: oneHostAndVm.vm.ip }
-  const xml = (await remoteSsh(glusterEndpoint, 'gluster --xml volume info xosan'))['stdout']
-  const parsedXml = parseXml(xml)
-  const volume = parsedXml['cliOutput']['volInfo']['volumes']['volume']
-  const optionsArray = volume['options']['option']
-  const info = clone(volume)
-  delete info['options']
-  delete info['bricks']
-  optionsArray.forEach(option => { info[option.name] = option.value })
-  info['Bricks'] = volume['bricks']['brick'].map(brick => {
-    const name = brick['name']
-    // IPV6
-    const ip = name.split(':')[0]
-    const vm = giantIPtoVMDict.vmForBrick(name)
-    return { uuid: brick['uuid'], isArbiter: brick['isArbiter'] === '1', brickLabel: name, ip: ip, vmId: vm ? vm.$id : null, vmLabel: vm ? vm.name_label : null }
-  })
-  return info
+  const oneHostAndVm = data.nodes[0]
+  return { xapi, host: xapi.getObject(oneHostAndVm.host), address: oneHostAndVm.vm.ip }
 }
 
 export async function getVolumeInfo ({ sr }) {
   const xapi = this.getXapi(sr)
-  const info = await _getVolumeInfo(xapi, sr)
-  return { info }
+  const glusterEndpoint = _getGlusterEndpoint(xapi, sr)
+  const giantIPtoVMDict = _getIPToVMDict(xapi, sr)
+  const volumeCommands = ['info xosan', 'status xosan', 'heal xosan info']
+  const [infoParsed, status, heal] = await asyncMap(volumeCommands, async cmd => parseXml((await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume ' + cmd, true))['stdout'])['cliOutput'])
+  const brickDictByUuid = {}
+  const brickDictByName = {}
+  infoParsed['volInfo']['volumes']['volume']['bricks']['brick'].forEach(brick => {
+    const name = brick['name']
+    const vm = giantIPtoVMDict.vmForBrick(name)
+    const brickValue = {
+      info: brick,
+      status: [],
+      heal: {},
+      splitbrain: {},
+      uuid: brick['uuid'],
+      vmId: vm ? vm.$id : null,
+      vmLabel: vm ? vm.name_label : null
+    }
+    brickDictByUuid[brick.hostUuid] = brickValue
+    brickDictByName[brick.name] = brickValue
+  })
+  heal['healInfo']['bricks']['brick'].forEach(brick => {
+    // disconnected bricks have their hostUuid filed set to '-' by the 'volume heal info' command, we grab them by name
+    brickDictByName[brick.name]['heal'] = brick
+    if (brick['file'] && !isArray(brick['file'])) {
+      brick['file'] = [brick['file']]
+    }
+  })
+  status['volStatus']['volumes']['volume']['node'].forEach(node => {
+    brickDictByUuid[node.peerid]['status'].push(node)
+  })
+  const bricks = []
+  forOwn(brickDictByUuid, value => {
+    bricks.push(value)
+  })
+  infoParsed['volInfo']['volumes']['volume'].bricks = bricks
+  infoParsed['volInfo']['volumes']['volume'].options = infoParsed['volInfo']['volumes']['volume'].options.option
+  return infoParsed['volInfo']['volumes']['volume']
 }
 
 getVolumeInfo.description = 'info on gluster volume'
@@ -94,7 +113,7 @@ function floor2048 (value) {
 }
 
 async function copyVm (xapi, originalVm, sr) {
-  return {sr, vm: await xapi.copyVm(originalVm, sr)}
+  return { sr, vm: await xapi.copyVm(originalVm, sr) }
 }
 
 async function prepareGlusterVm (xapi, vmAndParam, xosanNetwork, increaseDataDisk = true) {

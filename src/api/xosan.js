@@ -7,7 +7,9 @@ import { tap } from 'promise-toolbox'
 import {
   includes,
   forOwn,
-  isArray
+  isArray,
+  find,
+  remove
 } from 'lodash'
 
 import {
@@ -358,6 +360,40 @@ function _getBrickName (hostname) {
   return hostname + ':/bricks/xosan/xosandir'
 }
 
+export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
+  // TODO: a bit of user input validation on 'previousBrick', it's going to ssh
+  const previousIp = previousBrick.split(':')[0]
+  const xapi = this.getXapi(xosansr)
+  const nodes = xapi.xo.getData(xosansr, 'xosan_config').nodes
+  const newIpAddress = _findAFreeIPAddress(nodes)
+  const previousNode = find(nodes, node => node.vm.ip === previousIp)
+  const glusterEndpoint2 = { xapi, host: xapi.getObject(nodes[0].host), address: nodes[0].vm.ip }
+  await xapi.deleteVm(_getIPToVMDict(xapi, xosansr).vmForBrick(previousBrick), true)
+  const arbiter = previousNode.arbiter
+  let { data, newVM, addressAndHost, glusterEndpoint } = await insertNewGlusterVm.call(this, xapi, xosansr, newLvmSr, arbiter ? '_arbiter' : '', glusterEndpoint2, newIpAddress, !arbiter)
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume replace-brick xosan ' + previousBrick + ' ' + _getBrickName(addressAndHost.address) + ' commit force')
+  await remoteSsh(glusterEndpoint2, 'gluster --mode=script --xml peer detach ' + previousIp, true)
+  remove(data.nodes, node => node.vm.ip === previousIp)
+  data.nodes.push({
+    host: addressAndHost.host.$id,
+    arbiter: arbiter,
+    vm: { ip: addressAndHost.address, id: newVM.$id }
+  })
+  await xapi.xo.setData(xosansr, 'xosan_config', data)
+}
+
+replaceBrick.description = 'replaceBrick brick in gluster volume'
+replaceBrick.permission = 'admin'
+replaceBrick.params = {
+  xosansr: { type: 'string' },
+  previousBrick: { type: 'string' },
+  newLvmSr: { type: 'string' }
+}
+
+replaceBrick.resolve = {
+  xosansr: ['sr', 'SR', 'administrate']
+}
+
 async function _prepareGlusterVm2 (xapi, lvmSr, newVM, xosanNetwork, ipAddress, labelSuffix = '', increaseDataDisk = true) {
   const sshKey = await getOrCreateSshKey(xapi)
   const host = lvmSr.$PBDs[0].$host
@@ -400,7 +436,7 @@ function _findAFreeIPAddress (nodes) {
   return null
 }
 
-async function insertNewGlusterVm (xapi, xosansr, lvmsr, labelSuffix = '', glusterEndpoint = null, ipAddress = null) {
+async function insertNewGlusterVm (xapi, xosansr, lvmsr, labelSuffix = '', glusterEndpoint = null, ipAddress = null, increaseDataDisk = true) {
   const data = xapi.xo.getData(xosansr, 'xosan_config')
   if (ipAddress === null) {
     ipAddress = _findAFreeIPAddress(data.nodes)
@@ -409,7 +445,7 @@ async function insertNewGlusterVm (xapi, xosansr, lvmsr, labelSuffix = '', glust
   const srObject = xapi.getObject(lvmsr)
   // can't really copy an existing VM, because existing gluster VMs disks might too huge to be copied.
   const newVM = await _importGlusterVM.call(this, xapi, data.template, lvmsr)
-  const addressAndHost = await _prepareGlusterVm2(xapi, srObject, newVM, xosanNetwork, ipAddress, labelSuffix)
+  const addressAndHost = await _prepareGlusterVm2(xapi, srObject, newVM, xosanNetwork, ipAddress, labelSuffix, increaseDataDisk)
   if (!glusterEndpoint) {
     glusterEndpoint = { xapi, host: addressAndHost.host, address: data.nodes[0].vm.ip }
   }

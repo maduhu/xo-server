@@ -302,7 +302,7 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
       const arbiterIP = NETWORK_PREFIX + (vmIpLastNumber++)
       const arbiterVm = await xapi.copyVm(firstVM, sr)
       $onFailure(() => xapi.deleteVm(arbiterVm, true))
-      arbiter = await _prepareGlusterVm2(xapi, sr, arbiterVm, xosanNetwork, arbiterIP, '_arbiter')
+      arbiter = await _prepareGlusterVm2(xapi, sr, arbiterVm, xosanNetwork, arbiterIP, '_arbiter', false)
     }
     const ipAndHosts = await asyncMap(vmsAndSrs, vmAndSr => _prepareGlusterVm2(xapi, vmAndSr.sr, vmAndSr.vm, xosanNetwork, NETWORK_PREFIX + (vmIpLastNumber++)))
     const firstIpAndHost = ipAndHosts[0]
@@ -358,7 +358,7 @@ function _getBrickName (hostname) {
   return hostname + ':/bricks/xosan/xosandir'
 }
 
-async function _prepareGlusterVm2 (xapi, lvmSr, newVM, xosanNetwork, ipAddress, labelSuffix = '') {
+async function _prepareGlusterVm2 (xapi, lvmSr, newVM, xosanNetwork, ipAddress, labelSuffix = '', increaseDataDisk = true) {
   const sshKey = await getOrCreateSshKey(xapi)
   const host = lvmSr.$PBDs[0].$host
   const vlan = xosanNetwork.$PIFs[0].vlan
@@ -376,7 +376,7 @@ async function _prepareGlusterVm2 (xapi, lvmSr, newVM, xosanNetwork, ipAddress, 
       'vm-data/vlan': String(vlan || 0)
     }
   }
-  return prepareGlusterVm(xapi, { vm: newVM, params: parameters }, xosanNetwork)
+  return prepareGlusterVm(xapi, { vm: newVM, params: parameters }, xosanNetwork, increaseDataDisk)
 }
 
 async function _importGlusterVM (xapi, template, lvmsr) {
@@ -387,6 +387,72 @@ async function _importGlusterVM (xapi, template, lvmsr) {
     autoPoweron: true
   })
   return newVM
+}
+
+function _findAFreeIPAddress (nodes) {
+  const vmIpLastNumber = 101
+  for (let i = vmIpLastNumber; i < 254; i++) {
+    const candidate = NETWORK_PREFIX + i
+    if (!nodes.find(n => n.vm.ip === candidate)) {
+      return candidate
+    }
+  }
+  return null
+}
+
+async function insertNewGlusterVm (xapi, xosansr, lvmsr, labelSuffix = '', glusterEndpoint = null, ipAddress = null) {
+  const data = xapi.xo.getData(xosansr, 'xosan_config')
+  if (ipAddress === null) {
+    ipAddress = _findAFreeIPAddress(data.nodes)
+  }
+  const xosanNetwork = xapi.getObject(data.network)
+  const srObject = xapi.getObject(lvmsr)
+  // can't really copy an existing VM, because existing gluster VMs disks might too huge to be copied.
+  const newVM = await _importGlusterVM.call(this, xapi, data.template, lvmsr)
+  const addressAndHost = await _prepareGlusterVm2(xapi, srObject, newVM, xosanNetwork, ipAddress, labelSuffix)
+  if (!glusterEndpoint) {
+    glusterEndpoint = { xapi, host: addressAndHost.host, address: data.nodes[0].vm.ip }
+  }
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer detach ' + addressAndHost.address, true)
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer probe ' + addressAndHost.address)
+  return { data, newVM, addressAndHost, glusterEndpoint }
+}
+
+export const addBrick = defer.onFailure(async function ($onFailure, { xosansr, lvmsr }) {
+  const xapi = this.getXapi(xosansr)
+  if (CURRENTLY_CREATING_SRS[xapi.pool.$id]) {
+    throw new Error('createSR is already running for this pool')
+  }
+  CURRENTLY_CREATING_SRS[xapi.pool.$id] = true
+  try {
+    const { data, newVM, addressAndHost, glusterEndpoint } = await insertNewGlusterVm.call(this, xapi, xosansr, lvmsr)
+    await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume add-brick xosan replica 4 ' + _getBrickName(addressAndHost.address))
+    data.nodes.push({ host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: addressAndHost.address } })
+    await xapi.xo.setData(xosansr, 'xosan_config', data)
+    const arbiterNode = data.nodes.find(n => n['arbiter'])
+    if (arbiterNode) {
+      await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume remove-brick xosan replica 3 ' + _getBrickName(arbiterNode.vm.ip) + ' force')
+      await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer detach ' + arbiterNode.vm.ip, true)
+      await xapi.deleteVm(arbiterNode.vm.id, true)
+      data.nodes = data.nodes.filter(n => n !== arbiterNode)
+      data.type = 'replica'
+      await xapi.xo.setData(xosansr, 'xosan_config', data)
+    }
+  } finally {
+    delete CURRENTLY_CREATING_SRS[xapi.pool.$id]
+  }
+})
+
+addBrick.description = 'add brick to XOSAN SR'
+addBrick.permission = 'admin'
+addBrick.params = {
+  xosansr: { type: 'string' },
+  lvmsr: { type: 'string' }
+}
+
+addBrick.resolve = {
+  xosansr: ['sr', 'SR', 'administrate'],
+  lvmsr: ['sr', 'SR', 'administrate']
 }
 
 export function checkSrIsBusy ({ poolId }) {

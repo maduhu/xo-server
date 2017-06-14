@@ -367,12 +367,13 @@ export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
   const nodes = xapi.xo.getData(xosansr, 'xosan_config').nodes
   const newIpAddress = _findAFreeIPAddress(nodes)
   const previousNode = find(nodes, node => node.vm.ip === previousIp)
-  const glusterEndpoint2 = { xapi, host: xapi.getObject(nodes[0].host), address: nodes[0].vm.ip }
+  const stayingNode = find(nodes, node => node !== previousNode)
+  const glusterEndpoint = { xapi, host: xapi.getObject(stayingNode.host), address: stayingNode.vm.ip }
   await xapi.deleteVm(_getIPToVMDict(xapi, xosansr).vmForBrick(previousBrick), true)
   const arbiter = previousNode.arbiter
-  let { data, newVM, addressAndHost, glusterEndpoint } = await insertNewGlusterVm.call(this, xapi, xosansr, newLvmSr, arbiter ? '_arbiter' : '', glusterEndpoint2, newIpAddress, !arbiter)
+  let { data, newVM, addressAndHost } = await insertNewGlusterVm.call(this, xapi, xosansr, newLvmSr, arbiter ? '_arbiter' : '', glusterEndpoint, newIpAddress, !arbiter)
   await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume replace-brick xosan ' + previousBrick + ' ' + _getBrickName(addressAndHost.address) + ' commit force')
-  await remoteSsh(glusterEndpoint2, 'gluster --mode=script --xml peer detach ' + previousIp, true)
+  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer detach ' + previousIp, true)
   remove(data.nodes, node => node.vm.ip === previousIp)
   data.nodes.push({
     host: addressAndHost.host.$id,

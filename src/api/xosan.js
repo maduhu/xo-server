@@ -226,7 +226,6 @@ async function getOrCreateSshKey (xapi) {
   return sshKey
 }
 async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter = null) {
-
   const configByType = {
     replica_arbiter: {
       creation: 'replica 3 arbiter 1',
@@ -448,7 +447,7 @@ function _findAFreeIPAddress (nodes) {
 }
 
 async function insertNewGlusterVm (xapi, xosansr, lvmsr, labelSuffix = '', glusterEndpoint = null, ipAddress = null, increaseDataDisk = true) {
-  const data = xapi.xo.getData(xosansr, 'xosan_config')
+  const data = xapi.xo.getData(xosansr, 'xos@an_config')
   if (ipAddress === null) {
     ipAddress = _findAFreeIPAddress(data.nodes)
   }

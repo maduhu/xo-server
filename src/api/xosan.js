@@ -9,7 +9,8 @@ import {
   forOwn,
   isArray,
   find,
-  remove
+  remove,
+  filter
 } from 'lodash'
 
 import {
@@ -54,7 +55,7 @@ function _getGlusterEndpoint (xapi, sr) {
     return null
   }
   const oneHostAndVm = data.nodes[0]
-  return { xapi, host: xapi.getObject(oneHostAndVm.host), address: oneHostAndVm.vm.ip }
+  return { xapi, host: xapi.getObject(oneHostAndVm.host), addresses: map(data.nodes, node => node.vm.ip) }
 }
 
 export async function getVolumeInfo ({ sr }) {
@@ -62,7 +63,8 @@ export async function getVolumeInfo ({ sr }) {
   const glusterEndpoint = _getGlusterEndpoint(xapi, sr)
   const giantIPtoVMDict = _getIPToVMDict(xapi, sr)
   const volumeCommands = ['info xosan', 'status xosan', 'heal xosan info']
-  const [infoParsed, status, heal] = await asyncMap(volumeCommands, async cmd => parseXml((await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume ' + cmd, true))['stdout'])['cliOutput'])
+  const [infoParsed, status, heal] = await asyncMap(volumeCommands, async cmd =>
+    parseXml((await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume ' + cmd, true))['stdout'])['cliOutput'])
   const brickDictByUuid = {}
   const brickDictByName = {}
   infoParsed['volInfo']['volumes']['volume']['bricks']['brick'].forEach(brick => {
@@ -165,15 +167,22 @@ async function callPlugin (xapi, host, command, params) {
 }
 
 async function remoteSsh (glusterEndpoint, cmd, ignoreError = false) {
-  const result = await callPlugin(glusterEndpoint.xapi, glusterEndpoint.host, 'run_ssh', {
-    destination: 'root@' + glusterEndpoint.address,
-    cmd: cmd
-  })
-  debug(result)
-  if (!ignoreError && result.exit !== 0) {
-    throw new Error('ssh error: ' + JSON.stringify(result))
+  let result
+  for (let address of glusterEndpoint.addresses) {
+    result = await callPlugin(glusterEndpoint.xapi, glusterEndpoint.host, 'run_ssh', {
+      destination: 'root@' + address,
+      cmd: cmd
+    })
+    debug(result)
+    // 255 seems to be ssh's own error codes.
+    if (result.exit !== 255) {
+      if (!ignoreError && result.exit !== 0) {
+        throw new Error('ssh error: ' + JSON.stringify(result))
+      }
+      return result
+    }
   }
-  return result
+  throw new Error(result ? 'ssh error: ' + JSON.stringify(result) : 'no suitable SSH host: ' + JSON.stringify(glusterEndpoint))
 }
 
 async function setPifIp (xapi, pif, address) {
@@ -216,8 +225,8 @@ async function getOrCreateSshKey (xapi) {
 
   return sshKey
 }
-async function configureGluster (redundancy, ipAndHosts, xapi, firstIpAndHost, glusterType, arbiter = null) {
-  const glusterEndpoint = { xapi, host: firstIpAndHost.host, address: firstIpAndHost.address }
+async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter = null) {
+
   const configByType = {
     replica_arbiter: {
       creation: 'replica 3 arbiter 1',
@@ -308,7 +317,8 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
     }
     const ipAndHosts = await asyncMap(vmsAndSrs, vmAndSr => _prepareGlusterVm2(xapi, vmAndSr.sr, vmAndSr.vm, xosanNetwork, NETWORK_PREFIX + (vmIpLastNumber++)))
     const firstIpAndHost = ipAndHosts[0]
-    await configureGluster(redundancy, ipAndHosts, xapi, firstIpAndHost, glusterType, arbiter)
+    const glusterEndpoint = { xapi, host: firstIpAndHost.host, addresses: map(ipAndHosts, ih => ih.address) }
+    await configureGluster(redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter)
     debug('xosan gluster volume started')
     const config = { server: firstIpAndHost.address + ':/xosan', backupserver: ipAndHosts[1].address }
     const xosanSr = await xapi.call('SR.create', firstSr.$PBDs[0].$host.$ref, config, 0, 'XOSAN', 'XOSAN', 'xosan', '', true, {})
@@ -368,7 +378,7 @@ export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
   const newIpAddress = _findAFreeIPAddress(nodes)
   const previousNode = find(nodes, node => node.vm.ip === previousIp)
   const stayingNode = find(nodes, node => node !== previousNode)
-  const glusterEndpoint = { xapi, host: xapi.getObject(stayingNode.host), address: stayingNode.vm.ip }
+  const glusterEndpoint = { xapi, host: xapi.getObject(stayingNode.host), addresses: map(filter(nodes, node => node !== previousNode), node => node.vm.ip) }
   await xapi.deleteVm(_getIPToVMDict(xapi, xosansr).vmForBrick(previousBrick), true)
   const arbiter = previousNode.arbiter
   let { data, newVM, addressAndHost } = await insertNewGlusterVm.call(this, xapi, xosansr, newLvmSr, arbiter ? '_arbiter' : '', glusterEndpoint, newIpAddress, !arbiter)
@@ -448,7 +458,7 @@ async function insertNewGlusterVm (xapi, xosansr, lvmsr, labelSuffix = '', glust
   const newVM = await _importGlusterVM.call(this, xapi, data.template, lvmsr)
   const addressAndHost = await _prepareGlusterVm2(xapi, srObject, newVM, xosanNetwork, ipAddress, labelSuffix, increaseDataDisk)
   if (!glusterEndpoint) {
-    glusterEndpoint = { xapi, host: addressAndHost.host, address: data.nodes[0].vm.ip }
+    glusterEndpoint = { xapi, host: addressAndHost.host, addresses: map(data.nodes, node => node.vm.ip) }
   }
   await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer detach ' + addressAndHost.address, true)
   await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer probe ' + addressAndHost.address)

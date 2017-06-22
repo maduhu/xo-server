@@ -63,14 +63,14 @@ export async function getVolumeInfo ({ sr }) {
   const glusterEndpoint = _getGlusterEndpoint(xapi, sr)
   const giantIPtoVMDict = _getIPToVMDict(xapi, sr)
   const volumeCommands = ['info xosan', 'status xosan', 'heal xosan info']
-  function parseIfOk(glusterResult) {
-    if (glusterResult['exit'] === 0){
+  function parseIfOk (glusterResult) {
+    if (glusterResult['exit'] === 0) {
       const parsed = parseXml(glusterResult['stdout'])
       if (parsed['cliOutput']['opRet'] === '0') {
         return parsed['cliOutput']
       }
     }
-    return null;
+    return null
   }
   const [infoParsed, status, heal] = await asyncMap(volumeCommands, async cmd =>
     parseIfOk(await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume ' + cmd, true)))

@@ -175,6 +175,10 @@ export default {
     // Destroys the VIFs cloned from the template.
     await Promise.all(mapToArray(vm.$VIFs, vif => this._deleteVif(vif)))
 
+    if (vm.$VIFs.length !== 0) {
+      await this._waitObjectState(vm.$id, vm => vm.$VIFs.length === 0)
+    }
+
     // Creates the VIFs specified by the user.
     let nVifs = 0
     if (vifs) {

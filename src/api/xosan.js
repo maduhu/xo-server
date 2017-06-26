@@ -23,7 +23,8 @@ const debug = createLogger('xo:xosan')
 const SSH_KEY_FILE = 'id_rsa_xosan'
 const NETWORK_PREFIX = '172.31.100.'
 
-const XOSAN_VM_SYSTEM_DISK_SIZE = 10 * 1024 * 1024 * 1024
+const GIGABYTE = 1024 * 1024 * 1024
+const XOSAN_VM_SYSTEM_DISK_SIZE = 10 * GIGABYTE
 const XOSAN_DATA_DISK_USEAGE_RATIO = 0.99
 const XOSAN_MAX_DISK_SIZE = 2093050 * 1024 * 1024 // a bit under 2To
 
@@ -93,7 +94,7 @@ export async function getVolumeInfo ({ sr }) {
   })
   if (heal !== null) {
     heal['healInfo']['bricks']['brick'].forEach(brick => {
-      // disconnected bricks have their hostUuid filed set to '-' by the 'volume heal info' command, we grab them by name
+      // disconnected bricks have their hostUuid field set to '-' by the 'volume heal info' command, we grab them by name
       brickDictByName[brick.name]['heal'] = brick
       if (brick['file'] && !isArray(brick['file'])) {
         brick['file'] = [brick['file']]
@@ -131,47 +132,6 @@ function floor2048 (value) {
 
 async function copyVm (xapi, originalVm, sr) {
   return { sr, vm: await xapi.copyVm(originalVm, sr) }
-}
-
-async function prepareGlusterVm (xapi, vmAndParam, xosanNetwork, increaseDataDisk = true) {
-  let vm = vmAndParam.vm
-  // refresh the object so that sizes are correct
-  const params = vmAndParam.params
-  const ip = params.xenstore_data['vm-data/ip']
-  const sr = xapi.getObject(params.sr.$id)
-  await xapi._waitObjectState(sr.$id, sr => Boolean(sr.$PBDs))
-  const host = sr.$PBDs[0].$host
-  const firstVif = vm.$VIFs[0]
-  if (xosanNetwork.$id !== firstVif.$network.$id) {
-    try {
-      await xapi.call('VIF.move', firstVif.$ref, xosanNetwork.$ref)
-    } catch (error) {
-      if (error.code === 'MESSAGE_METHOD_UNKNOWN') {
-        // VIF.move has been introduced in xenserver 7.0
-        await xapi.deleteVif(firstVif.$id)
-        await xapi.createVif(vm.$id, xosanNetwork.$id, firstVif)
-      }
-    }
-  }
-  await xapi.editVm(vm, {
-    name_label: params.name_label,
-    name_description: params.name_description
-  })
-  await xapi.call('VM.set_xenstore_data', vm.$ref, params.xenstore_data)
-  if (increaseDataDisk) {
-    const dataDisk = vm.$VBDs.map(vbd => vbd.$VDI).find(vdi => vdi && vdi.name_label === 'xosan_data')
-    const srFreeSpace = sr.physical_size - sr.physical_utilisation
-    // we use a percentage because it looks like the VDI overhead is proportional
-    const newSize = floor2048((srFreeSpace + dataDisk.virtual_size) * XOSAN_DATA_DISK_USEAGE_RATIO)
-    await xapi._resizeVdi(dataDisk, Math.min(newSize, XOSAN_MAX_DISK_SIZE))
-  }
-  await xapi.startVm(vm)
-  debug('waiting for boot of ', ip)
-  // wait until we find the assigned IP in the networks, we are just checking the boot is complete
-  const vmIsUp = vm => Boolean(vm.$guest_metrics && includes(vm.$guest_metrics.networks, ip))
-  vm = await xapi._waitObjectState(vm.$id, vmIsUp)
-  debug('booted ', ip)
-  return { address: ip, host, vm }
 }
 
 async function callPlugin (xapi, host, command, params) {
@@ -255,6 +215,7 @@ async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, gluste
   }
   let brickVms = arbiter ? ipAndHosts.concat(arbiter) : ipAndHosts
   for (let i = 1; i < brickVms.length; i++) {
+    console.log('*******************************')
     await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer probe ' + brickVms[i].address)
   }
   const creation = configByType[glusterType].creation
@@ -325,9 +286,9 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
       const arbiterIP = NETWORK_PREFIX + (vmIpLastNumber++)
       const arbiterVm = await xapi.copyVm(firstVM, sr)
       $onFailure(() => xapi.deleteVm(arbiterVm, true))
-      arbiter = await _prepareGlusterVm2(xapi, sr, arbiterVm, xosanNetwork, arbiterIP, '_arbiter', false)
+      arbiter = await _prepareGlusterVm(xapi, sr, arbiterVm, xosanNetwork, arbiterIP, '_arbiter', false)
     }
-    const ipAndHosts = await asyncMap(vmsAndSrs, vmAndSr => _prepareGlusterVm2(xapi, vmAndSr.sr, vmAndSr.vm, xosanNetwork, NETWORK_PREFIX + (vmIpLastNumber++)))
+    const ipAndHosts = await asyncMap(vmsAndSrs, vmAndSr => _prepareGlusterVm(xapi, vmAndSr.sr, vmAndSr.vm, xosanNetwork, NETWORK_PREFIX + (vmIpLastNumber++)))
     const firstIpAndHost = ipAndHosts[0]
     const glusterEndpoint = { xapi, host: firstIpAndHost.host, addresses: map(ipAndHosts, ih => ih.address) }
     await configureGluster(redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter)
@@ -391,7 +352,10 @@ export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
   const previousNode = find(nodes, node => node.vm.ip === previousIp)
   const stayingNode = find(nodes, node => node !== previousNode)
   const glusterEndpoint = { xapi, host: xapi.getObject(stayingNode.host), addresses: map(filter(nodes, node => node !== previousNode), node => node.vm.ip) }
-  await xapi.deleteVm(_getIPToVMDict(xapi, xosansr).vmForBrick(previousBrick), true)
+  const previousVM = _getIPToVMDict(xapi, xosansr).vmForBrick(previousBrick)
+  if (previousVM) {
+    await xapi.deleteVm(previousVM, true)
+  }
   const arbiter = previousNode.arbiter
   let { data, newVM, addressAndHost } = await insertNewGlusterVm.call(this, xapi, xosansr, newLvmSr, arbiter ? '_arbiter' : '', glusterEndpoint, newIpAddress, !arbiter)
   await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume replace-brick xosan ' + previousBrick + ' ' + _getBrickName(addressAndHost.address) + ' commit force')
@@ -417,25 +381,54 @@ replaceBrick.resolve = {
   xosansr: ['sr', 'SR', 'administrate']
 }
 
-async function _prepareGlusterVm2 (xapi, lvmSr, newVM, xosanNetwork, ipAddress, labelSuffix = '', increaseDataDisk = true) {
-  const sshKey = await getOrCreateSshKey(xapi)
+async function _prepareGlusterVm (xapi, lvmSr, newVM, xosanNetwork, ipAddress, labelSuffix = '', increaseDataDisk = true) {
   const host = lvmSr.$PBDs[0].$host
-  const vlan = xosanNetwork.$PIFs[0].vlan
-  const parameters = {
-    sr: lvmSr,
-    host,
-    name_label: `XOSAN - ${lvmSr.name_label} - ${host.name_label} ${labelSuffix}`,
-    name_description: 'Xosan VM storing data on volume ' + lvmSr.name_label,
-    // the values of the xenstore_data object *have* to be string, don't forget.
-    xenstore_data: {
-      'vm-data/hostname': 'XOSAN' + lvmSr.name_label + labelSuffix,
-      'vm-data/sshkey': sshKey.public,
-      'vm-data/ip': ipAddress,
-      'vm-data/mtu': String(xosanNetwork.MTU),
-      'vm-data/vlan': String(vlan || 0)
+  const xenstoreData = {
+    'vm-data/hostname': 'XOSAN' + lvmSr.name_label + labelSuffix,
+    'vm-data/sshkey': (await getOrCreateSshKey(xapi)).public,
+    'vm-data/ip': ipAddress,
+    'vm-data/mtu': String(xosanNetwork.MTU),
+    'vm-data/vlan': String(xosanNetwork.$PIFs[0].vlan || 0)
+  }
+  const ip = ipAddress
+  const sr = xapi.getObject(lvmSr.$id)
+  // refresh the object so that sizes are correct
+  await xapi._waitObjectState(sr.$id, sr => Boolean(sr.$PBDs))
+  const firstVif = newVM.$VIFs[0]
+  if (xosanNetwork.$id !== firstVif.$network.$id) {
+    try {
+      await xapi.call('VIF.move', firstVif.$ref, xosanNetwork.$ref)
+    } catch (error) {
+      if (error.code === 'MESSAGE_METHOD_UNKNOWN') {
+        // VIF.move has been introduced in xenserver 7.0
+        await xapi.deleteVif(firstVif.$id)
+        await xapi.createVif(newVM.$id, xosanNetwork.$id, firstVif)
+      }
     }
   }
-  return prepareGlusterVm(xapi, { vm: newVM, params: parameters }, xosanNetwork, increaseDataDisk)
+  const newMemory = GIGABYTE
+  await xapi.editVm(newVM, {
+    name_label: `XOSAN - ${lvmSr.name_label} - ${host.name_label} ${labelSuffix}`,
+    name_description: 'Xosan VM storage',
+    // https://bugs.xenserver.org/browse/XSO-762
+    memory_static_max: newMemory,
+    memory_dynamic_max: newMemory
+  })
+  await xapi.call('VM.set_xenstore_data', newVM.$ref, xenstoreData)
+  if (increaseDataDisk) {
+    const dataDisk = newVM.$VBDs.map(vbd => vbd.$VDI).find(vdi => vdi && vdi.name_label === 'xosan_data')
+    const srFreeSpace = sr.physical_size - sr.physical_utilisation
+    // we use a percentage because it looks like the VDI overhead is proportional
+    const newSize = floor2048((srFreeSpace + dataDisk.virtual_size) * XOSAN_DATA_DISK_USEAGE_RATIO)
+    await xapi._resizeVdi(dataDisk, Math.min(newSize, XOSAN_MAX_DISK_SIZE))
+  }
+  await xapi.startVm(newVM)
+  debug('waiting for boot of ', ip)
+  // wait until we find the assigned IP in the networks, we are just checking the boot is complete
+  const vmIsUp = vm => Boolean(vm.$guest_metrics && includes(vm.$guest_metrics.networks, ip))
+  const vm = await xapi._waitObjectState(newVM.$id, vmIsUp)
+  debug('booted ', ip)
+  return { address: ip, host, vm }
 }
 
 async function _importGlusterVM (xapi, template, lvmsr) {
@@ -460,15 +453,15 @@ function _findAFreeIPAddress (nodes) {
 }
 
 async function insertNewGlusterVm (xapi, xosansr, lvmsr, labelSuffix = '', glusterEndpoint = null, ipAddress = null, increaseDataDisk = true) {
-  const data = xapi.xo.getData(xosansr, 'xos@an_config')
+  const data = xapi.xo.getData(xosansr, 'xosan_config')
   if (ipAddress === null) {
     ipAddress = _findAFreeIPAddress(data.nodes)
   }
   const xosanNetwork = xapi.getObject(data.network)
   const srObject = xapi.getObject(lvmsr)
-  // can't really copy an existing VM, because existing gluster VMs disks might too huge to be copied.
+  // can't really copy an existing VM, because existing gluster VMs disks might too large to be copied.
   const newVM = await _importGlusterVM.call(this, xapi, data.template, lvmsr)
-  const addressAndHost = await _prepareGlusterVm2(xapi, srObject, newVM, xosanNetwork, ipAddress, labelSuffix, increaseDataDisk)
+  const addressAndHost = await _prepareGlusterVm(xapi, srObject, newVM, xosanNetwork, ipAddress, labelSuffix, increaseDataDisk)
   if (!glusterEndpoint) {
     glusterEndpoint = { xapi, host: addressAndHost.host, addresses: map(data.nodes, node => node.vm.ip) }
   }

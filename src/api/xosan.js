@@ -41,7 +41,7 @@ function _getIPToVMDict (xapi, sr) {
     const nodes = data.nodes
     nodes.forEach(conf => {
       try {
-        dict[conf.vm.ip] = xapi.getObject(conf.vm.id)
+        dict[conf.vm.ip] = {vm: xapi.getObject(conf.vm.id), sr: conf.underlyingSr}
       } catch (e) {
         // pass
       }
@@ -77,17 +77,19 @@ export async function getVolumeInfo ({ sr }) {
     parseIfOk(await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume ' + cmd, true)))
   const brickDictByUuid = {}
   const brickDictByName = {}
-  infoParsed['volInfo']['volumes']['volume']['bricks']['brick'].forEach(brick => {
+  const result = infoParsed['volInfo']['volumes']['volume']
+  result['bricks']['brick'].forEach(brick => {
     const name = brick['name']
-    const vm = giantIPtoVMDict.vmForBrick(name)
+    const vmEntry = giantIPtoVMDict.vmForBrick(name)
     const brickValue = {
       info: brick,
       status: [],
       heal: {},
       splitbrain: {},
       uuid: brick['uuid'],
-      vmId: vm ? vm.$id : null,
-      vmLabel: vm ? vm.name_label : null
+      vmId: vmEntry ? vmEntry.vm.$id : null,
+      vmLabel: vmEntry ? vmEntry.vm.name_label : null,
+      underlyingSr: vmEntry ? vmEntry.sr : null
     }
     brickDictByUuid[brick.hostUuid] = brickValue
     brickDictByName[brick.name] = brickValue
@@ -110,9 +112,9 @@ export async function getVolumeInfo ({ sr }) {
   forOwn(brickDictByUuid, value => {
     bricks.push(value)
   })
-  infoParsed['volInfo']['volumes']['volume'].bricks = bricks
-  infoParsed['volInfo']['volumes']['volume'].options = infoParsed['volInfo']['volumes']['volume'].options.option
-  return infoParsed['volInfo']['volumes']['volume']
+  result.bricks = bricks
+  result.options = result.options.option
+  return result
 }
 
 getVolumeInfo.description = 'info on gluster volume'
@@ -173,7 +175,6 @@ const createNetworkAndInsertHosts = defer.onFailure(async function ($onFailure, 
   })
   $onFailure(() => xapi.deleteNetwork(xosanNetwork))
   await Promise.all(xosanNetwork.$PIFs.map(pif => setPifIp(xapi, pif, NETWORK_PREFIX + (hostIpLastNumber++))))
-
   return xosanNetwork
 })
 async function getOrCreateSshKey (xapi) {
@@ -215,7 +216,6 @@ async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, gluste
   }
   let brickVms = arbiter ? ipAndHosts.concat(arbiter) : ipAndHosts
   for (let i = 1; i < brickVms.length; i++) {
-    console.log('*******************************')
     await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer probe ' + brickVms[i].address)
   }
   const creation = configByType[glusterType].creation
@@ -295,9 +295,9 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
     debug('xosan gluster volume started')
     const config = { server: firstIpAndHost.address + ':/xosan', backupserver: ipAndHosts[1].address }
     const xosanSr = await xapi.call('SR.create', firstSr.$PBDs[0].$host.$ref, config, 0, 'XOSAN', 'XOSAN', 'xosan', '', true, {})
-    const nodes = ipAndHosts.map(param => ({ host: param.host.$id, vm: { id: param.vm.$id, ip: param.address } }))
+    const nodes = ipAndHosts.map(param => ({ host: param.host.$id, vm: { id: param.vm.$id, ip: param.address }, underlyingSr: param.underlyingSr.$id }))
     if (arbiter) {
-      nodes.push({ host: arbiter.host.$id, vm: { id: arbiter.vm.$id, ip: arbiter.address }, arbiter: true })
+      nodes.push({ host: arbiter.host.$id, vm: { id: arbiter.vm.$id, ip: arbiter.address }, underlyingSr: arbiter.underlyingSr.$id, arbiter: true })
     }
     // we just forget because the cleanup actions will be executed before.
     $onFailure(() => xapi.forgetSr(xosanSr))
@@ -352,10 +352,7 @@ export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
   const previousNode = find(nodes, node => node.vm.ip === previousIp)
   const stayingNode = find(nodes, node => node !== previousNode)
   const glusterEndpoint = { xapi, host: xapi.getObject(stayingNode.host), addresses: map(filter(nodes, node => node !== previousNode), node => node.vm.ip) }
-  const previousVM = _getIPToVMDict(xapi, xosansr).vmForBrick(previousBrick)
-  if (previousVM) {
-    await xapi.deleteVm(previousVM, true)
-  }
+  const previousVMEntry = _getIPToVMDict(xapi, xosansr).vmForBrick(previousBrick)
   const arbiter = previousNode.arbiter
   let { data, newVM, addressAndHost } = await insertNewGlusterVm.call(this, xapi, xosansr, newLvmSr, arbiter ? '_arbiter' : '', glusterEndpoint, newIpAddress, !arbiter)
   await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume replace-brick xosan ' + previousBrick + ' ' + _getBrickName(addressAndHost.address) + ' commit force')
@@ -364,9 +361,13 @@ export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
   data.nodes.push({
     host: addressAndHost.host.$id,
     arbiter: arbiter,
-    vm: { ip: addressAndHost.address, id: newVM.$id }
+    vm: { ip: addressAndHost.address, id: newVM.$id },
+    underlyingSr: newLvmSr
   })
   await xapi.xo.setData(xosansr, 'xosan_config', data)
+  if (previousVMEntry) {
+    await xapi.deleteVm(previousVMEntry.vm, true)
+  }
 }
 
 replaceBrick.description = 'replaceBrick brick in gluster volume'
@@ -428,13 +429,13 @@ async function _prepareGlusterVm (xapi, lvmSr, newVM, xosanNetwork, ipAddress, l
   const vmIsUp = vm => Boolean(vm.$guest_metrics && includes(vm.$guest_metrics.networks, ip))
   const vm = await xapi._waitObjectState(newVM.$id, vmIsUp)
   debug('booted ', ip)
-  return { address: ip, host, vm }
+  return { address: ip, host, vm, underlyingSr: lvmSr }
 }
 
-async function _importGlusterVM (xapi, template, lvmsr) {
+async function _importGlusterVM (xapi, template, lvmsrId) {
   const templateStream = await this.requestResource('xosan', template.id, template.version)
   // can't really copy an existing VM, because sometimes we are on a smaller disk than the existing VMs
-  const newVM = await xapi.importVm(templateStream, { srId: lvmsr, type: 'xva' })
+  const newVM = await xapi.importVm(templateStream, { srId: lvmsrId, type: 'xva' })
   await xapi.editVm(newVM, {
     autoPoweron: true
   })
@@ -452,15 +453,15 @@ function _findAFreeIPAddress (nodes) {
   return null
 }
 
-async function insertNewGlusterVm (xapi, xosansr, lvmsr, labelSuffix = '', glusterEndpoint = null, ipAddress = null, increaseDataDisk = true) {
+async function insertNewGlusterVm (xapi, xosansr, lvmsrId, labelSuffix = '', glusterEndpoint = null, ipAddress = null, increaseDataDisk = true) {
   const data = xapi.xo.getData(xosansr, 'xosan_config')
   if (ipAddress === null) {
     ipAddress = _findAFreeIPAddress(data.nodes)
   }
   const xosanNetwork = xapi.getObject(data.network)
-  const srObject = xapi.getObject(lvmsr)
+  const srObject = xapi.getObject(lvmsrId)
   // can't really copy an existing VM, because existing gluster VMs disks might too large to be copied.
-  const newVM = await _importGlusterVM.call(this, xapi, data.template, lvmsr)
+  const newVM = await _importGlusterVM.call(this, xapi, data.template, lvmsrId)
   const addressAndHost = await _prepareGlusterVm(xapi, srObject, newVM, xosanNetwork, ipAddress, labelSuffix, increaseDataDisk)
   if (!glusterEndpoint) {
     glusterEndpoint = { xapi, host: addressAndHost.host, addresses: map(data.nodes, node => node.vm.ip) }
@@ -479,7 +480,7 @@ export const addBrick = defer.onFailure(async function ($onFailure, { xosansr, l
   try {
     const { data, newVM, addressAndHost, glusterEndpoint } = await insertNewGlusterVm.call(this, xapi, xosansr, lvmsr)
     await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume add-brick xosan replica 4 ' + _getBrickName(addressAndHost.address))
-    data.nodes.push({ host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: addressAndHost.address } })
+    data.nodes.push({ host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: addressAndHost.address }, underlyingSr: lvmsr })
     await xapi.xo.setData(xosansr, 'xosan_config', data)
     const arbiterNode = data.nodes.find(n => n['arbiter'])
     if (arbiterNode) {

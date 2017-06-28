@@ -2038,7 +2038,7 @@ export default class Xapi extends XapiBase {
   }
 
   @deferrable.onFailure
-  async createBondedNetwork ($onFailure,{
+  async createBondedNetwork ($onFailure, {
     bondMode,
     mac,
     pifIds,

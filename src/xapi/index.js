@@ -1979,8 +1979,8 @@ export default class Xapi extends XapiBase {
       )
     )
   }
-
-  async createNetwork ({
+  @deferrable.onFailure
+  async createNetwork ($onFailure, {
     name,
     description = 'Created with Xen Orchestra',
     pifId,
@@ -1993,6 +1993,7 @@ export default class Xapi extends XapiBase {
       MTU: asInteger(mtu),
       other_config: {}
     })
+    $onFailure(() => this.call('network.destroy', networkRef))
     if (pifId) {
       await this.call('pool.create_VLAN_from_PIF', this.getObject(pifId).$ref, networkRef, asInteger(vlan))
     }

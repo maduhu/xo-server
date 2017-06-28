@@ -2037,13 +2037,15 @@ export default class Xapi extends XapiBase {
     )
   }
 
-  async createBondedNetwork ({
+  @deferrable.onFailure
+  async createBondedNetwork ($onFailure,{
     bondMode,
     mac,
     pifIds,
     ...params
   }) {
     const network = await this.createNetwork(params)
+    $onFailure(() => this.deleteNetwork(network))
     // TODO: test and confirm:
     // Bond.create is called here with PIFs from one host but XAPI should then replicate the
     // bond on each host in the same pool with the corresponding PIFs (ie same interface names?).

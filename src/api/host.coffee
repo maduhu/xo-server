@@ -127,7 +127,7 @@ detach = ({host}) ->
   { user: username, password } = xapi._auth
 
   server = yield this.registerXenServer({
-    host: @getObject(host).address,
+    host: host.address,
     password,
     username
   })

@@ -121,7 +121,18 @@ exports.stop = stop
 #---------------------------------------------------------------------
 
 detach = ({host}) ->
-  return @getXapi(host).ejectHostFromPool(host._xapiId)
+  xapi = @getXapi(host)
+  yield xapi.ejectHostFromPool(host._xapiId)
+
+  { user: username, password } = xapi._auth
+
+  server = yield this.registerXenServer({
+    host: @getObject(host).address,
+    password,
+    username
+  })
+
+  yield this.connectXenServer(server.id)
 
 detach.description = 'eject the host of a pool'
 

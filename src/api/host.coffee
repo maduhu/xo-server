@@ -120,7 +120,7 @@ exports.stop = stop
 
 #---------------------------------------------------------------------
 
-detach = ({host}) ->
+detach = $coroutine ({host}) ->
   xapi = @getXapi(host)
   yield xapi.ejectHostFromPool(host._xapiId)
 
@@ -132,7 +132,7 @@ detach = ({host}) ->
     username
   })
 
-  yield this.connectXenServer(server.id)
+  this.connectXenServer(server.id)
 
 detach.description = 'eject the host of a pool'
 

@@ -5,6 +5,7 @@ import { some } from 'lodash'
 import Xapi from '../xapi'
 import xapiObjectToXo from '../xapi-object-to-xo'
 import XapiStats from '../xapi-stats'
+import { parseUrl } from 'xen-api'
 import {
   camelToSnakeCase,
   createRawObject,
@@ -315,7 +316,7 @@ export default class {
       const servers = await this.getAllXenServers()
       const serverExists = some(
         servers,
-        server => server.host === url.hostname
+        server => parseUrl(server.host).hostname === url.hostname
       )
 
       if (serverExists) {

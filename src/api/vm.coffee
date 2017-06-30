@@ -82,16 +82,6 @@ create = $coroutine (params) ->
     memory: template.memory.dynamic[1],
     vms: 1
   }
-  vdiSizesByDevice = {}
-  forEach(xapi.getObject(template._xapiId).$VBDs, (vbd) =>
-    if (
-      vbd.type is 'Disk' and
-      (vdi = vbd.$VDI)
-    )
-      vdiSizesByDevice[vbd.userdevice] = +vdi.virtual_size
-
-    return
-  )
 
   vdis = extract(params, 'VDIs')
   params.vdis = vdis and map(vdis, (vdi) =>
@@ -109,6 +99,7 @@ create = $coroutine (params) ->
     })
   )
 
+  vdiSizesByDevice = {}
   existingVdis = extract(params, 'existingDisks')
   params.existingVdis = existingVdis and map(existingVdis, (vdi, userdevice) =>
     if vdi.size?

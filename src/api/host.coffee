@@ -9,6 +9,7 @@ startsWith = require 'lodash/startsWith'
 {
   extractProperty,
   mapToArray,
+  noop,
   parseXml
 } = require '../utils'
 
@@ -126,13 +127,14 @@ detach = $coroutine ({host}) ->
 
   { user: username, password } = xapi._auth
 
-  server = yield this.registerXenServer({
+  this.registerXenServer({
     host: host.address,
     password,
     username
-  })
-
-  this.connectXenServer(server.id)
+  }).then(
+    (server) -> this.connectXenServer(server.id),
+    noop
+  )
 
 detach.description = 'eject the host of a pool'
 

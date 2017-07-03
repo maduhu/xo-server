@@ -1,11 +1,11 @@
 import { ignoreErrors } from 'promise-toolbox'
 import { noSuchObject } from 'xo-common/api-errors'
+import { parseUrl } from 'xen-api'
 import { some } from 'lodash'
 
 import Xapi from '../xapi'
 import xapiObjectToXo from '../xapi-object-to-xo'
 import XapiStats from '../xapi-stats'
-import { parseUrl } from 'xen-api'
 import {
   camelToSnakeCase,
   createRawObject,

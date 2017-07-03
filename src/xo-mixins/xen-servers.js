@@ -1,7 +1,10 @@
 import { ignoreErrors } from 'promise-toolbox'
 import { noSuchObject } from 'xo-common/api-errors'
 import { parseUrl } from 'xen-api'
-import { some } from 'lodash'
+import {
+  isEqual,
+  some
+} from 'lodash'
 
 import Xapi from '../xapi'
 import xapiObjectToXo from '../xapi-object-to-xo'
@@ -316,7 +319,7 @@ export default class {
       const servers = await this.getAllXenServers()
       const serverExists = some(
         servers,
-        server => parseUrl(server.host).hostname === url.hostname
+        server => isEqual(parseUrl(server.host), url)
       )
 
       if (serverExists) {

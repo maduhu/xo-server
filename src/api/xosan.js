@@ -3,7 +3,7 @@ import defer from 'golike-defer'
 import execa from 'execa'
 import fs from 'fs-extra'
 import map from 'lodash/map'
-import { tap } from 'promise-toolbox'
+import { tap, delay } from 'promise-toolbox'
 import {
   includes,
   isArray,
@@ -67,7 +67,7 @@ export async function getVolumeInfo ({ sr, infoType }) {
       if (parsed['cliOutput']['opRet'] === '0') {
         return {commandStatus: true, result: parsed['cliOutput']}
       }
-      return {commandStatus: false, error: parsed['opErrstr']}
+      return {commandStatus: false, error: parsed['cliOutput']['opErrstr']}
     }
     return {commandStatus: false, error: glusterResult['stderr']}
   }
@@ -166,7 +166,10 @@ async function remoteSsh (glusterEndpoint, cmd, ignoreError = false) {
         }
       }
     }
-    debug(result)
+    debug(result.command.join(' '))
+    debug('=>exit:', result.exit)
+    debug('=>err :', result.stderr)
+    debug('=>out :', result.stdout)
     // 255 seems to be ssh's own error codes.
     if (result.exit !== 255) {
       if (!ignoreError && result.exit !== 0) {
@@ -178,13 +181,26 @@ async function remoteSsh (glusterEndpoint, cmd, ignoreError = false) {
   throw new Error(result ? 'ssh error: ' + JSON.stringify(result) : 'no suitable SSH host: ' + JSON.stringify(glusterEndpoint))
 }
 
+async function glusterCmd (glusterEndpoint, cmd, ignoreError = false) {
+  const result = await remoteSsh(glusterEndpoint, `gluster --mode=script --xml ${cmd}`, ignoreError)
+  if (result['exit'] === 0) {
+    const parsed = parseXml(result['stdout'])
+    result.parsed = parsed
+    if (!ignoreError && parsed['cliOutput']['opRet'].trim() !== '0') {
+      throw new Error(`error in gluster "${parsed['cliOutput']['opErrstr']}"`)
+    }
+    return result
+  }
+  throw new Error(`error in gluster "${result['stderr']}"`)
+}
+
 const createNetworkAndInsertHosts = defer.onFailure(async function ($onFailure, xapi, pif, vlan) {
   let hostIpLastNumber = 1
   const xosanNetwork = await xapi.createNetwork({
     name: 'XOSAN network',
     description: 'XOSAN network',
     pifId: pif._xapiId,
-    mtu: 9000,
+    mtu: pif.mtu,
     vlan: +vlan
   })
   $onFailure(() => xapi.deleteNetwork(xosanNetwork))
@@ -223,7 +239,7 @@ async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, gluste
     },
     replica: {
       creation: 'replica ' + redundancy + ' ',
-      extra: ['gluster --mode=script --xml volume set xosan cluster.data-self-heal on']
+      extra: ['volume set xosan cluster.data-self-heal on']
     },
     disperse: {
       creation: 'disperse ' + ipAndHosts.length + ' redundancy ' + redundancy + ' ',
@@ -231,30 +247,38 @@ async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, gluste
     }
   }
   let brickVms = arbiter ? ipAndHosts.concat(arbiter) : ipAndHosts
-  for (let i = 1; i < brickVms.length; i++) {
-    await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer probe ' + brickVms[i].address)
+  await Promise.all(map(brickVms.slice(1), bv => glusterCmd(glusterEndpoint, 'peer probe ' + bv.address)))
+  async function poolIsOnline () {
+    // localhost never gives its state, so it's always in cluster. '3' means "in cluster"
+    const peerIsInCluster = peer => peer.connected === '1' && (peer.hostname === 'localhost' || peer.state === '3')
+    const poolList = await glusterCmd(glusterEndpoint, 'pool list')
+    return poolList.parsed.cliOutput.peerStatus.peer.reduce((previous, peer) => previous && peerIsInCluster(peer), true)
+  }
+  while (!await poolIsOnline()) {
+    debug('waiting for the pool')
+    await delay(500)
   }
   const creation = configByType[glusterType].creation
-  const volumeCreation = 'gluster --mode=script --xml volume create xosan ' + creation +
-    ' ' + brickVms.map(ipAndHost => _getBrickName(ipAndHost.address)).join(' ')
+  const volumeCreation = 'volume create xosan ' + creation + ' ' +
+    brickVms.map(ipAndHost => _getBrickName(ipAndHost.address)).join(' ')
   debug('creating volume: ', volumeCreation)
-  await remoteSsh(glusterEndpoint, volumeCreation)
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan network.remote-dio enable')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan cluster.eager-lock enable')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.io-cache off')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.read-ahead off')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.quick-read off')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.strict-write-ordering off')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan client.event-threads 8')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan server.event-threads 8')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.io-thread-count 64')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan performance.stat-prefetch on')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan features.shard on')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume set xosan features.shard-block-size 512MB')
+  await glusterCmd(glusterEndpoint, volumeCreation)
+  await glusterCmd(glusterEndpoint, 'volume set xosan network.remote-dio enable')
+  await glusterCmd(glusterEndpoint, 'volume set xosan cluster.eager-lock enable')
+  await glusterCmd(glusterEndpoint, 'volume set xosan performance.io-cache off')
+  await glusterCmd(glusterEndpoint, 'volume set xosan performance.read-ahead off')
+  await glusterCmd(glusterEndpoint, 'volume set xosan performance.quick-read off')
+  await glusterCmd(glusterEndpoint, 'volume set xosan performance.strict-write-ordering off')
+  await glusterCmd(glusterEndpoint, 'volume set xosan client.event-threads 8')
+  await glusterCmd(glusterEndpoint, 'volume set xosan server.event-threads 8')
+  await glusterCmd(glusterEndpoint, 'volume set xosan performance.io-thread-count 64')
+  await glusterCmd(glusterEndpoint, 'volume set xosan performance.stat-prefetch on')
+  await glusterCmd(glusterEndpoint, 'volume set xosan features.shard on')
+  await glusterCmd(glusterEndpoint, 'volume set xosan features.shard-block-size 512MB')
   for (const confChunk of configByType[glusterType].extra) {
-    await remoteSsh(glusterEndpoint, confChunk)
+    await glusterCmd(glusterEndpoint, confChunk)
   }
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume start xosan')
+  await glusterCmd(glusterEndpoint, 'volume start xosan')
 }
 
 export const createSR = defer.onFailure(async function ($onFailure, { template, pif, vlan, srs, glusterType, redundancy }) {
@@ -321,7 +345,7 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
       host: param.host.$id,
       vm: {id: param.vm.$id, ip: param.address},
       underlyingSr: param.underlyingSr.$id,
-      arbiter: param['arbiter']
+      arbiter: !!param['arbiter']
     }))
     await xapi.xo.setData(xosanSr, 'xosan_config', {
       nodes: nodes,
@@ -431,7 +455,7 @@ async function _prepareGlusterVm (xapi, lvmSr, newVM, xosanNetwork, ipAddress, l
       }
     }
   }
-  const newMemory = GIGABYTE
+  const newMemory = 2 * GIGABYTE
   await xapi.editVm(newVM, {
     name_label: `XOSAN - ${lvmSr.name_label} - ${host.name_label} ${labelSuffix}`,
     name_description: 'Xosan VM storage',

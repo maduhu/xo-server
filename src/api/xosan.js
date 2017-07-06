@@ -61,24 +61,9 @@ export async function getVolumeInfo ({ sr, infoType }) {
   const xapi = this.getXapi(sr)
   const glusterEndpoint = _getGlusterEndpoint(xapi, sr)
 
-  function parseIfOkOrNot (glusterResult) {
-    if (glusterResult['exit'] === 0) {
-      const parsed = parseXml(glusterResult['stdout'])
-      if (parsed['cliOutput']['opRet'] === '0') {
-        return {commandStatus: true, result: parsed['cliOutput']}
-      }
-      return {commandStatus: false, error: parsed['cliOutput']['opErrstr']}
-    }
-    return {commandStatus: false, error: glusterResult['stderr']}
-  }
-
-  function parseHeal (glusterResult) {
-    const parsed = parseIfOkOrNot(glusterResult)
-    if (!parsed['commandStatus']) {
-      return parsed
-    }
+  function parseHeal (parsed) {
     const bricks = []
-    parsed['result']['healInfo']['bricks']['brick'].forEach(brick => {
+    parsed['healInfo']['bricks']['brick'].forEach(brick => {
       bricks.push(brick)
       if (brick['file'] && !isArray(brick['file'])) {
         brick['file'] = [brick['file']]
@@ -87,28 +72,21 @@ export async function getVolumeInfo ({ sr, infoType }) {
     return {commandStatus: true, result: {bricks}}
   }
 
-  function parseStatus (glusterResult) {
-    const parsed = parseIfOkOrNot(glusterResult)
-    if (!parsed['commandStatus']) {
-      return parsed
-    }
+  function parseStatus (parsed) {
     const brickDictByUuid = {}
-    parsed['result']['volStatus']['volumes']['volume']['node'].forEach(node => {
+    const volume = parsed['volStatus']['volumes']['volume']
+    volume['node'].forEach(node => {
       brickDictByUuid[node.peerid] = brickDictByUuid[node.peerid] || []
       brickDictByUuid[node.peerid].push(node)
     })
     return {
       commandStatus: true,
-      result: {nodes: brickDictByUuid, tasks: parsed['result']['volStatus']['volumes']['volume']['tasks']}
+      result: {nodes: brickDictByUuid, tasks: volume['tasks']}
     }
   }
 
-  function parseInfo (glusterResult) {
-    const parsed = parseIfOkOrNot(glusterResult)
-    if (!parsed['commandStatus']) {
-      return parsed
-    }
-    const volume = parsed['result']['volInfo']['volumes']['volume']
+  function parseInfo (parsed) {
+    const volume = parsed['volInfo']['volumes']['volume']
     volume['bricks'] = volume['bricks']['brick']
     volume['options'] = volume['options']['option']
     return {commandStatus: true, result: volume}
@@ -117,13 +95,22 @@ export async function getVolumeInfo ({ sr, infoType }) {
   const infoTypes = {
     heal: {command: 'heal xosan info', handler: parseHeal},
     status: {command: 'status xosan', handler: parseStatus},
+    statusDetail: {command: 'status xosan detail', handler: parseStatus},
+    statusMem: {command: 'status xosan mem', handler: parseStatus},
     info: {command: 'info xosan', handler: parseInfo}
   }
   const foundType = infoTypes[infoType]
   if (!foundType) {
     throw new Error('getVolumeInfo(): "' + infoType + '" is an invalid type')
   }
-  return foundType.handler(await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume ' + foundType.command, true))
+
+  const cmd = 'volume ' + foundType.command
+  let commandResult
+  while ((commandResult = await glusterCmd(glusterEndpoint, cmd, true)) && !commandResult['commandStatus'] && commandResult.parsed['cliOutput']['opErrno'] === '30802') {
+    debug('got opErrno 30802, waiting and retrying')
+    await delay(500 * Math.random())
+  }
+  return commandResult['commandStatus'] ? foundType.handler(commandResult.parsed['cliOutput']) : commandResult
 }
 
 getVolumeInfo.description = 'info on gluster volume'
@@ -184,14 +171,19 @@ async function remoteSsh (glusterEndpoint, cmd, ignoreError = false) {
 async function glusterCmd (glusterEndpoint, cmd, ignoreError = false) {
   const result = await remoteSsh(glusterEndpoint, `gluster --mode=script --xml ${cmd}`, ignoreError)
   if (result['exit'] === 0) {
-    const parsed = parseXml(result['stdout'])
-    result.parsed = parsed
-    if (!ignoreError && parsed['cliOutput']['opRet'].trim() !== '0') {
-      throw new Error(`error in gluster "${parsed['cliOutput']['opErrstr']}"`)
-    }
-    return result
+    result.parsed = parseXml(result['stdout'])
+    result.commandStatus = result.parsed['cliOutput']['opRet'].trim() === '0'
+    result.error = result.parsed['cliOutput']['opErrstr']
+  } else  {
+    result.commandStatus = false
+    result.error = result['stderr']
   }
-  throw new Error(`error in gluster "${result['stderr']}"`)
+  if (!ignoreError && !result.commandStatus) {
+      const error = new Error(`error in gluster "${result.error}"`)
+      error.result = result
+      throw error
+  }
+  return result
 }
 
 const createNetworkAndInsertHosts = defer.onFailure(async function ($onFailure, xapi, pif, vlan) {

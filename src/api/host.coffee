@@ -11,7 +11,6 @@ startsWith = require 'lodash/startsWith'
 {
   extractProperty,
   mapToArray,
-  noop,
   parseXml
 } = require '../utils'
 

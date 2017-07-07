@@ -6,6 +6,8 @@ endsWith = require 'lodash/endsWith'
 startsWith = require 'lodash/startsWith'
 {coroutine: $coroutine} = require 'bluebird'
 {format} = require 'json-rpc-peer'
+{ignoreErrors} = require 'promise-toolbox'
+
 {
   extractProperty,
   mapToArray,
@@ -132,9 +134,8 @@ detach = $coroutine ({host}) ->
     password,
     username
   }).then(
-    (server) -> this.connectXenServer(server.id),
-    noop
-  )
+    (server) -> this.connectXenServer(server.id)
+  )::ignoreErrors()
 
 detach.description = 'eject the host of a pool'
 

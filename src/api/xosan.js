@@ -174,14 +174,14 @@ async function glusterCmd (glusterEndpoint, cmd, ignoreError = false) {
     result.parsed = parseXml(result['stdout'])
     result.commandStatus = result.parsed['cliOutput']['opRet'].trim() === '0'
     result.error = result.parsed['cliOutput']['opErrstr']
-  } else  {
+  } else {
     result.commandStatus = false
     result.error = result['stderr']
   }
   if (!ignoreError && !result.commandStatus) {
-      const error = new Error(`error in gluster "${result.error}"`)
-      error.result = result
-      throw error
+    const error = new Error(`error in gluster "${result.error}"`)
+    error.result = result
+    throw error
   }
   return result
 }
@@ -223,6 +223,21 @@ async function getOrCreateSshKey (xapi) {
 
   return sshKey
 }
+
+async function _probePoolAndWaitForPresence(glusterEndpoint, addresses) {
+  await Promise.all(map(addresses, address => glusterCmd(glusterEndpoint, 'peer probe ' + address)))
+  // localhost never gives its state, so it's always in cluster. '3' means "in cluster"
+  const peerIsInCluster = peer => (peer.connected === '1') && (peer.hostname === 'localhost' || peer.state === '3')
+  async function poolIsOnline () {
+    const poolList = await glusterCmd(glusterEndpoint, 'pool list')
+    return poolList.parsed.cliOutput.peerStatus.peer.reduce((previous, peer) => previous && peerIsInCluster(peer), true)
+  }
+  while (!await poolIsOnline()) {
+    debug('waiting for the pool')
+    await delay(500 * Math.random())
+  }
+}
+
 async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter = null) {
   const configByType = {
     replica_arbiter: {
@@ -239,17 +254,7 @@ async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, gluste
     }
   }
   let brickVms = arbiter ? ipAndHosts.concat(arbiter) : ipAndHosts
-  await Promise.all(map(brickVms.slice(1), bv => glusterCmd(glusterEndpoint, 'peer probe ' + bv.address)))
-  async function poolIsOnline () {
-    // localhost never gives its state, so it's always in cluster. '3' means "in cluster"
-    const peerIsInCluster = peer => peer.connected === '1' && (peer.hostname === 'localhost' || peer.state === '3')
-    const poolList = await glusterCmd(glusterEndpoint, 'pool list')
-    return poolList.parsed.cliOutput.peerStatus.peer.reduce((previous, peer) => previous && peerIsInCluster(peer), true)
-  }
-  while (!await poolIsOnline()) {
-    debug('waiting for the pool')
-    await delay(500)
-  }
+  await _probePoolAndWaitForPresence(glusterEndpoint, map(brickVms.slice(1), bv=>bv.address))
   const creation = configByType[glusterType].creation
   const volumeCreation = 'volume create xosan ' + creation + ' ' +
     brickVms.map(ipAndHost => _getBrickName(ipAndHost.address)).join(' ')
@@ -394,8 +399,8 @@ export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
   const arbiter = previousNode.arbiter
   let { data, newVM, addressAndHost } = await this::insertNewGlusterVm(xapi, xosansr, newLvmSr, arbiter ? '_arbiter' : '', glusterEndpoint, newIpAddress, !arbiter)
   const brickName = _getBrickName(addressAndHost.address)
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume replace-brick xosan ' + previousBrick + ' ' + brickName + ' commit force')
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer detach ' + previousIp, true)
+  await glusterCmd(glusterEndpoint, `volume replace-brick xosan ${previousBrick} ${brickName} commit force`)
+  await glusterCmd(glusterEndpoint, 'peer detach ' + previousIp, true)
   remove(data.nodes, node => node.vm.ip === previousIp)
   data.nodes.push({
     brickName: brickName,
@@ -506,8 +511,8 @@ async function insertNewGlusterVm (xapi, xosansr, lvmsrId, labelSuffix = '', glu
   if (!glusterEndpoint) {
     glusterEndpoint = _getGlusterEndpoint(xapi, xosansr)
   }
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer detach ' + addressAndHost.address, true)
-  await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer probe ' + addressAndHost.address)
+  await glusterCmd(glusterEndpoint, 'peer detach ' + addressAndHost.address, true)
+  await _probePoolAndWaitForPresence(glusterEndpoint, [addressAndHost.address])
   return { data, newVM, addressAndHost, glusterEndpoint }
 }
 

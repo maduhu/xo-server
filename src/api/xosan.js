@@ -224,7 +224,7 @@ async function getOrCreateSshKey (xapi) {
   return sshKey
 }
 
-async function _probePoolAndWaitForPresence(glusterEndpoint, addresses) {
+async function _probePoolAndWaitForPresence (glusterEndpoint, addresses) {
   await Promise.all(map(addresses, address => glusterCmd(glusterEndpoint, 'peer probe ' + address)))
   // localhost never gives its state, so it's always in cluster. '3' means "in cluster"
   const peerIsInCluster = peer => (peer.connected === '1') && (peer.hostname === 'localhost' || peer.state === '3')
@@ -254,7 +254,7 @@ async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, gluste
     }
   }
   let brickVms = arbiter ? ipAndHosts.concat(arbiter) : ipAndHosts
-  await _probePoolAndWaitForPresence(glusterEndpoint, map(brickVms.slice(1), bv=>bv.address))
+  await _probePoolAndWaitForPresence(glusterEndpoint, map(brickVms.slice(1), bv => bv.address))
   const creation = configByType[glusterType].creation
   const volumeCreation = 'volume create xosan ' + creation + ' ' +
     brickVms.map(ipAndHost => _getBrickName(ipAndHost.address)).join(' ')
@@ -525,13 +525,13 @@ export const addBrick = defer.onFailure(async function ($onFailure, { xosansr, l
   try {
     const { data, newVM, addressAndHost, glusterEndpoint } = await this::insertNewGlusterVm(xapi, xosansr, lvmsr)
     const brickName = _getBrickName(addressAndHost.address)
-    await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume add-brick xosan replica 4 ' + brickName)
+    await glusterCmd(glusterEndpoint, `volume add-brick xosan replica ${data.nodes.length + 1} ${brickName}`)
     data.nodes.push({ brickName, host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: addressAndHost.address }, underlyingSr: lvmsr })
     await xapi.xo.setData(xosansr, 'xosan_config', data)
     const arbiterNode = data.nodes.find(n => n['arbiter'])
     if (arbiterNode) {
-      await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml volume remove-brick xosan replica 3 ' + _getBrickName(arbiterNode.vm.ip) + ' force')
-      await remoteSsh(glusterEndpoint, 'gluster --mode=script --xml peer detach ' + arbiterNode.vm.ip, true)
+      await glusterCmd(glusterEndpoint, `volume remove-brick xosan replica ${data.nodes.length - 1} ${_getBrickName(arbiterNode.vm.ip)} force`)
+      await glusterCmd(glusterEndpoint, 'peer detach ' + arbiterNode.vm.ip, true)
       await xapi.deleteVm(arbiterNode.vm.id, true)
       data.nodes = data.nodes.filter(n => n !== arbiterNode)
       data.type = 'replica'

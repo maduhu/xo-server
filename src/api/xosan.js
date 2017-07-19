@@ -177,11 +177,14 @@ async function glusterCmd (glusterEndpoint, cmd, ignoreError = false) {
   const result = await remoteSsh(glusterEndpoint, `gluster --mode=script --xml ${cmd}`, ignoreError)
   if (result['exit'] === 0) {
     result.parsed = parseXml(result['stdout'])
-    result.commandStatus = result.parsed['cliOutput']['opRet'].trim() === '0'
-    result.error = result.parsed['cliOutput']['opErrstr']
+    const cliOut = result.parsed['cliOutput']
+    // we have found cases where opErrno is !=0 and opRet was 0, albeit the operation was an error.
+    result.commandStatus = cliOut['opRet'].trim() === '0' && cliOut['opErrno'].trim() === '0'
+    result.error = cliOut['opErrstr']
   } else {
     result.commandStatus = false
-    result.error = result['stderr']
+    // "gluster volume status" timeout error message is reported on stdout instead of stderr
+    result.error = result['stderr'].length ? result['stderr'] : result['stdout']
   }
   if (!ignoreError && !result.commandStatus) {
     const error = new Error(`error in gluster "${result.error}"`)
@@ -229,8 +232,11 @@ async function getOrCreateSshKey (xapi) {
   return sshKey
 }
 
-async function _probePoolAndWaitForPresence (glusterEndpoint, addresses) {
-  await Promise.all(map(addresses, address => glusterCmd(glusterEndpoint, 'peer probe ' + address)))
+const _probePoolAndWaitForPresence = defer.onFailure(async function($onFailure,glusterEndpoint, addresses) {
+  await asyncMap(addresses, async (address) => {
+    await glusterCmd(glusterEndpoint, 'peer probe ' + address)
+    $onFailure(() => glusterCmd(glusterEndpoint, 'peer detach ' + address, true))
+  })
   function shouldRetry (peers) {
     for (let peer of peers) {
       if (peer.state === '4') {
@@ -245,7 +251,7 @@ async function _probePoolAndWaitForPresence (glusterEndpoint, addresses) {
 
   const getPoolStatus = async () => (await glusterCmd(glusterEndpoint, 'pool list')).parsed.cliOutput.peerStatus.peer
   return rateLimitedRetry(getPoolStatus, shouldRetry)
-}
+})
 
 async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter = null) {
   const configByType = {
@@ -525,7 +531,7 @@ function _findIPAddressOutsideList (reservedList) {
   return null
 }
 
-async function insertNewGlusterVm (xapi, xosansr, lvmsrId, {labelSuffix = '', glusterEndpoint = null, ipAddress = null,
+const insertNewGlusterVm = defer.onFailure(async function($onFailure, xapi, xosansr, lvmsrId, {labelSuffix = '', glusterEndpoint = null, ipAddress = null,
   increaseDataDisk = true, maxDiskSize = Infinity}) {
   const data = xapi.xo.getData(xosansr, 'xosan_config')
   if (ipAddress === null) {
@@ -535,13 +541,14 @@ async function insertNewGlusterVm (xapi, xosansr, lvmsrId, {labelSuffix = '', gl
   const srObject = xapi.getObject(lvmsrId)
   // can't really copy an existing VM, because existing gluster VMs disks might too large to be copied.
   const newVM = await this::_importGlusterVM(xapi, data.template, lvmsrId)
+  $onFailure(() => xapi.deleteVm(newVM, true))
   const addressAndHost = await _prepareGlusterVm(xapi, srObject, newVM, xosanNetwork, ipAddress, {labelSuffix, increaseDataDisk, maxDiskSize})
   if (!glusterEndpoint) {
     glusterEndpoint = this::_getGlusterEndpoint(xosansr)
   }
   await _probePoolAndWaitForPresence(glusterEndpoint, [addressAndHost.address])
   return { data, newVM, addressAndHost, glusterEndpoint }
-}
+})
 
 export const addBricks = defer.onFailure(async function ($onFailure, { xosansr, lvmsrs }) {
   const xapi = this.getXapi(xosansr)
@@ -607,12 +614,14 @@ export const removeBricks = defer.onFailure(async function ($onFailure, { xosans
   CURRENTLY_CREATING_SRS[xapi.pool.$id] = true
   try {
     const data = xapi.xo.getData(xosansr, 'xosan_config')
+    //IPV6
     const ips = map(bricks, b => b.split(':')[0])
     const glusterEndpoint = this::_getGlusterEndpoint(xosansr)
     const dict = _getIPToVMDict(xapi, xosansr)
     const brickVMs = map(bricks, b => dict[b])
     const replicaPart = data.type === 'replica_arbiter' || data.type === 'replica' ? `replica ${data.nodes.length - bricks.length}` : ''
     await glusterCmd(glusterEndpoint, `volume remove-brick xosan ${replicaPart} ${bricks.join(' ')} force`)
+    await asyncMap(ips, ip => glusterCmd(glusterEndpoint, 'peer detach ' + ip, true))
     remove(data.nodes, node => ips.includes(node.vm.ip))
     await xapi.xo.setData(xosansr, 'xosan_config', data)
     await asyncMap(brickVMs, vm => xapi.deleteVm(vm.vm, true))

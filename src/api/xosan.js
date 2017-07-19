@@ -11,7 +11,6 @@ import {
   remove,
   filter
 } from 'lodash'
-
 import {
   asyncMap,
   parseXml
@@ -21,26 +20,23 @@ const debug = createLogger('xo:xosan')
 
 const SSH_KEY_FILE = 'id_rsa_xosan'
 const NETWORK_PREFIX = '172.31.100.'
-
 const GIGABYTE = 1024 * 1024 * 1024
 const XOSAN_VM_SYSTEM_DISK_SIZE = 10 * GIGABYTE
 const XOSAN_DATA_DISK_USEAGE_RATIO = 0.99
 const XOSAN_MAX_DISK_SIZE = 2093050 * 1024 * 1024 // a bit under 2To
 
+// TODO remove MAX_DISK_SIZE limitation. it's just used during the beta. the entire variable and its uses should disappear
+const MAX_DISK_SIZE = 100 * GIGABYTE
+
 const CURRENTLY_CREATING_SRS = {}
 
 function _getIPToVMDict (xapi, sr) {
   const dict = {}
-  dict.vmForBrick = brick => {
-    // IPV6
-    return dict[brick.split(':')[0]]
-  }
   const data = xapi.xo.getData(sr, 'xosan_config')
   if (data && data.nodes) {
-    const nodes = data.nodes
-    nodes.forEach(conf => {
+    data.nodes.forEach(conf => {
       try {
-        dict[conf.vm.ip] = {vm: xapi.getObject(conf.vm.id), sr: conf.underlyingSr}
+        dict[conf.brickName] = {vm: xapi.getObject(conf.vm.id), sr: conf.underlyingSr}
       } catch (e) {
         // pass
       }
@@ -49,7 +45,8 @@ function _getIPToVMDict (xapi, sr) {
   return dict
 }
 
-function _getGlusterEndpoint (xapi, sr) {
+function _getGlusterEndpoint (sr) {
+  const xapi = this.getXapi(sr)
   const data = xapi.xo.getData(sr, 'xosan_config')
   if (!data || !data.nodes) {
     return null
@@ -57,9 +54,20 @@ function _getGlusterEndpoint (xapi, sr) {
   return { xapi, hosts: map(data.nodes, node => xapi.getObject(node.host)), addresses: map(data.nodes, node => node.vm.ip) }
 }
 
+async function rateLimitedRetry (action, shouldRetry, retryCount = 20) {
+  let retryDelay = 500 * (1 + Math.random() / 20)
+  let result
+  while (retryCount > 0 && (result = await action()) && shouldRetry(result)) {
+    retryDelay *= 1.1
+    debug('waiting ' + retryDelay + 'ms and retrying')
+    await delay(retryDelay)
+    retryCount--
+  }
+  return result
+}
+
 export async function getVolumeInfo ({ sr, infoType }) {
-  const xapi = this.getXapi(sr)
-  const glusterEndpoint = _getGlusterEndpoint(xapi, sr)
+  const glusterEndpoint = this::_getGlusterEndpoint(sr)
 
   function parseHeal (parsed) {
     const bricks = []
@@ -104,12 +112,9 @@ export async function getVolumeInfo ({ sr, infoType }) {
     throw new Error('getVolumeInfo(): "' + infoType + '" is an invalid type')
   }
 
-  const cmd = 'volume ' + foundType.command
-  let commandResult
-  while ((commandResult = await glusterCmd(glusterEndpoint, cmd, true)) && !commandResult['commandStatus'] && commandResult.parsed['cliOutput']['opErrno'] === '30802') {
-    debug('got opErrno 30802, waiting and retrying')
-    await delay(500 * Math.random())
-  }
+  const cmdShouldRetry = result => !result['commandStatus'] && result.parsed && result.parsed['cliOutput']['opErrno'] === '30802'
+  const runCmd = async () => glusterCmd(glusterEndpoint, 'volume ' + foundType.command, true)
+  let commandResult = await rateLimitedRetry(runCmd, cmdShouldRetry)
   return commandResult['commandStatus'] ? foundType.handler(commandResult.parsed['cliOutput']) : commandResult
 }
 
@@ -226,16 +231,20 @@ async function getOrCreateSshKey (xapi) {
 
 async function _probePoolAndWaitForPresence (glusterEndpoint, addresses) {
   await Promise.all(map(addresses, address => glusterCmd(glusterEndpoint, 'peer probe ' + address)))
-  // localhost never gives its state, so it's always in cluster. '3' means "in cluster"
-  const peerIsInCluster = peer => (peer.connected === '1') && (peer.hostname === 'localhost' || peer.state === '3')
-  async function poolIsOnline () {
-    const poolList = await glusterCmd(glusterEndpoint, 'pool list')
-    return poolList.parsed.cliOutput.peerStatus.peer.reduce((previous, peer) => previous && peerIsInCluster(peer), true)
+  function shouldRetry (peers) {
+    for (let peer of peers) {
+      if (peer.state === '4') {
+        return true
+      }
+      if (peer.state === '6') {
+        throw new Error(`${peer.hostname} is not in pool ("${peer.stateStr}")`)
+      }
+    }
+    return false
   }
-  while (!await poolIsOnline()) {
-    debug('waiting for the pool')
-    await delay(500 * Math.random())
-  }
+
+  const getPoolStatus = async () => (await glusterCmd(glusterEndpoint, 'pool list')).parsed.cliOutput.peerStatus.peer
+  return rateLimitedRetry(getPoolStatus, shouldRetry)
 }
 
 async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter = null) {
@@ -276,6 +285,15 @@ async function configureGluster (redundancy, ipAndHosts, glusterEndpoint, gluste
     await glusterCmd(glusterEndpoint, confChunk)
   }
   await glusterCmd(glusterEndpoint, 'volume start xosan')
+}
+
+async function testSR ({sr}) {
+  const xapi = this.getXapi(sr)
+  const newVM = await this::_importGlusterVM(xapi, xapi.xo.getData(sr, 'xosan_config').template, sr)
+  await xapi.editVm(newVM, {
+    name_label: 'XOSAN test',
+    name_description: 'XOSAN test, you can delete it'
+  })
 }
 
 export const createSR = defer.onFailure(async function ($onFailure, { template, pif, vlan, srs, glusterType, redundancy }) {
@@ -323,10 +341,11 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
       const arbiterIP = NETWORK_PREFIX + (vmIpLastNumber++)
       const arbiterVm = await xapi.copyVm(firstVM, sr)
       $onFailure(() => xapi.deleteVm(arbiterVm, true))
-      arbiter = await _prepareGlusterVm(xapi, sr, arbiterVm, xosanNetwork, arbiterIP, '_arbiter', false)
+      arbiter = await _prepareGlusterVm(xapi, sr, arbiterVm, xosanNetwork, arbiterIP, {labelSuffix: '_arbiter', increaseDataDisk: false})
       arbiter.arbiter = true
     }
-    const ipAndHosts = await asyncMap(vmsAndSrs, vmAndSr => _prepareGlusterVm(xapi, vmAndSr.sr, vmAndSr.vm, xosanNetwork, NETWORK_PREFIX + (vmIpLastNumber++)))
+    const ipAndHosts = await asyncMap(vmsAndSrs, vmAndSr => _prepareGlusterVm(xapi, vmAndSr.sr, vmAndSr.vm, xosanNetwork,
+      NETWORK_PREFIX + (vmIpLastNumber++), {maxDiskSize: MAX_DISK_SIZE}))
     const glusterEndpoint = { xapi, hosts: map(ipAndHosts, ih => ih.host), addresses: map(ipAndHosts, ih => ih.address) }
     await configureGluster(redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter)
     debug('xosan gluster volume started')
@@ -348,8 +367,10 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
       nodes: nodes,
       template: template,
       network: xosanNetwork.$id,
-      type: glusterType
+      type: glusterType,
+      redundancy
     })
+    await this::testSR({sr: xosanSr})
   } finally {
     delete CURRENTLY_CREATING_SRS[xapi.pool.$id]
   }
@@ -395,9 +416,10 @@ export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
   const previousNode = find(nodes, node => node.vm.ip === previousIp)
   const stayingNodes = filter(nodes, node => node !== previousNode)
   const glusterEndpoint = { xapi, hosts: map(stayingNodes, node => xapi.getObject(node.host)), addresses: map(stayingNodes, node => node.vm.ip) }
-  const previousVMEntry = _getIPToVMDict(xapi, xosansr).vmForBrick(previousBrick)
+  const previousVMEntry = _getIPToVMDict(xapi, xosansr)[previousBrick]
   const arbiter = previousNode.arbiter
-  let { data, newVM, addressAndHost } = await this::insertNewGlusterVm(xapi, xosansr, newLvmSr, arbiter ? '_arbiter' : '', glusterEndpoint, newIpAddress, !arbiter)
+  let { data, newVM, addressAndHost } = await this::insertNewGlusterVm(xapi, xosansr, newLvmSr,
+    {labelSuffix: arbiter ? '_arbiter' : '', glusterEndpoint, newIpAddress, increaseDataDisk: !arbiter})
   const brickName = _getBrickName(addressAndHost.address)
   await glusterCmd(glusterEndpoint, `volume replace-brick xosan ${previousBrick} ${brickName} commit force`)
   await glusterCmd(glusterEndpoint, 'peer detach ' + previousIp, true)
@@ -427,7 +449,7 @@ replaceBrick.resolve = {
   xosansr: ['sr', 'SR', 'administrate']
 }
 
-async function _prepareGlusterVm (xapi, lvmSr, newVM, xosanNetwork, ipAddress, labelSuffix = '', increaseDataDisk = true) {
+async function _prepareGlusterVm (xapi, lvmSr, newVM, xosanNetwork, ipAddress, {labelSuffix = '', increaseDataDisk = true, maxDiskSize = Infinity}) {
   const host = lvmSr.$PBDs[0].$host
   const xenstoreData = {
     'vm-data/hostname': 'XOSAN' + lvmSr.name_label + labelSuffix,
@@ -465,7 +487,8 @@ async function _prepareGlusterVm (xapi, lvmSr, newVM, xosanNetwork, ipAddress, l
     const dataDisk = newVM.$VBDs.map(vbd => vbd.$VDI).find(vdi => vdi && vdi.name_label === 'xosan_data')
     const srFreeSpace = sr.physical_size - sr.physical_utilisation
     // we use a percentage because it looks like the VDI overhead is proportional
-    const newSize = floor2048((srFreeSpace + dataDisk.virtual_size) * XOSAN_DATA_DISK_USEAGE_RATIO)
+    const newSize = floor2048(Math.min(maxDiskSize, (srFreeSpace + dataDisk.virtual_size) * XOSAN_DATA_DISK_USEAGE_RATIO))
+    // TODO remove MAX_DISK_SIZE limitation. it's just used during the beta
     await xapi._resizeVdi(dataDisk, Math.min(newSize, XOSAN_MAX_DISK_SIZE))
   }
   await xapi.startVm(newVM)
@@ -488,17 +511,22 @@ async function _importGlusterVM (xapi, template, lvmsrId) {
 }
 
 function _findAFreeIPAddress (nodes) {
+  return _findIPAddressOutsideList(map(nodes, n => n.vm.ip))
+}
+
+function _findIPAddressOutsideList (reservedList) {
   const vmIpLastNumber = 101
-  for (let i = vmIpLastNumber; i < 254; i++) {
+  for (let i = vmIpLastNumber; i < 255; i++) {
     const candidate = NETWORK_PREFIX + i
-    if (!nodes.find(n => n.vm.ip === candidate)) {
+    if (!reservedList.find(a => a === candidate)) {
       return candidate
     }
   }
   return null
 }
 
-async function insertNewGlusterVm (xapi, xosansr, lvmsrId, labelSuffix = '', glusterEndpoint = null, ipAddress = null, increaseDataDisk = true) {
+async function insertNewGlusterVm (xapi, xosansr, lvmsrId, {labelSuffix = '', glusterEndpoint = null, ipAddress = null,
+  increaseDataDisk = true, maxDiskSize = Infinity}) {
   const data = xapi.xo.getData(xosansr, 'xosan_config')
   if (ipAddress === null) {
     ipAddress = _findAFreeIPAddress(data.nodes)
@@ -507,26 +535,39 @@ async function insertNewGlusterVm (xapi, xosansr, lvmsrId, labelSuffix = '', glu
   const srObject = xapi.getObject(lvmsrId)
   // can't really copy an existing VM, because existing gluster VMs disks might too large to be copied.
   const newVM = await this::_importGlusterVM(xapi, data.template, lvmsrId)
-  const addressAndHost = await _prepareGlusterVm(xapi, srObject, newVM, xosanNetwork, ipAddress, labelSuffix, increaseDataDisk)
+  const addressAndHost = await _prepareGlusterVm(xapi, srObject, newVM, xosanNetwork, ipAddress, {labelSuffix, increaseDataDisk, maxDiskSize})
   if (!glusterEndpoint) {
-    glusterEndpoint = _getGlusterEndpoint(xapi, xosansr)
+    glusterEndpoint = this::_getGlusterEndpoint(xosansr)
   }
-  await glusterCmd(glusterEndpoint, 'peer detach ' + addressAndHost.address, true)
   await _probePoolAndWaitForPresence(glusterEndpoint, [addressAndHost.address])
   return { data, newVM, addressAndHost, glusterEndpoint }
 }
 
-export const addBrick = defer.onFailure(async function ($onFailure, { xosansr, lvmsr }) {
+export const addBricks = defer.onFailure(async function ($onFailure, { xosansr, lvmsrs }) {
   const xapi = this.getXapi(xosansr)
   if (CURRENTLY_CREATING_SRS[xapi.pool.$id]) {
     throw new Error('createSR is already running for this pool')
   }
   CURRENTLY_CREATING_SRS[xapi.pool.$id] = true
   try {
-    const { data, newVM, addressAndHost, glusterEndpoint } = await this::insertNewGlusterVm(xapi, xosansr, lvmsr)
-    const brickName = _getBrickName(addressAndHost.address)
-    await glusterCmd(glusterEndpoint, `volume add-brick xosan replica ${data.nodes.length + 1} ${brickName}`)
-    data.nodes.push({ brickName, host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: addressAndHost.address }, underlyingSr: lvmsr })
+    const data = xapi.xo.getData(xosansr, 'xosan_config')
+    const usedAddresses = map(data.nodes, n => n.vm.ip)
+    const glusterEndpoint = this::_getGlusterEndpoint(xosansr)
+    const newAddresses = []
+    const newNodes = []
+    for (let newSr of lvmsrs) {
+      const ipAddress = _findIPAddressOutsideList(usedAddresses.concat(newAddresses))
+      newAddresses.push(ipAddress)
+      // TODO remove MAX_DISK_SIZE limitation. it's just used during the beta
+      const { newVM, addressAndHost } = await this::insertNewGlusterVm(xapi, xosansr, newSr, {ipAddress, maxDiskSize: MAX_DISK_SIZE})
+      $onFailure(() => glusterCmd(glusterEndpoint, 'peer detach ' + ipAddress, true))
+      $onFailure(() => xapi.deleteVm(newVM, true))
+      const brickName = _getBrickName(ipAddress)
+      newNodes.push({ brickName, host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: ipAddress }, underlyingSr: newSr })
+    }
+    const replicaPart = data.type === 'replica_arbiter' || data.type === 'replica' ? `replica ${data.nodes.length + lvmsrs.length}` : ''
+    await glusterCmd(glusterEndpoint, `volume add-brick xosan ${replicaPart} ${newNodes.map(n => n.brickName).join(' ')}`)
+    data.nodes = data.nodes.concat(newNodes)
     await xapi.xo.setData(xosansr, 'xosan_config', data)
     const arbiterNode = data.nodes.find(n => n['arbiter'])
     if (arbiterNode) {
@@ -542,16 +583,52 @@ export const addBrick = defer.onFailure(async function ($onFailure, { xosansr, l
   }
 })
 
-addBrick.description = 'add brick to XOSAN SR'
-addBrick.permission = 'admin'
-addBrick.params = {
+addBricks.description = 'add brick to XOSAN SR'
+addBricks.permission = 'admin'
+addBricks.params = {
   xosansr: { type: 'string' },
-  lvmsr: { type: 'string' }
+  lvmsrs: {
+    type: 'array',
+    items: {
+      type: 'string'
+    } }
 }
 
-addBrick.resolve = {
+addBricks.resolve = {
   xosansr: ['sr', 'SR', 'administrate'],
-  lvmsr: ['sr', 'SR', 'administrate']
+  lvmsrs: ['sr', 'SR', 'administrate']
+}
+
+export const removeBricks = defer.onFailure(async function ($onFailure, { xosansr, bricks }) {
+  const xapi = this.getXapi(xosansr)
+  if (CURRENTLY_CREATING_SRS[xapi.pool.$id]) {
+    throw new Error('this there is already a XOSAN operation running on this pool')
+  }
+  CURRENTLY_CREATING_SRS[xapi.pool.$id] = true
+  try {
+    const data = xapi.xo.getData(xosansr, 'xosan_config')
+    const ips = map(bricks, b => b.split(':')[0])
+    const glusterEndpoint = this::_getGlusterEndpoint(xosansr)
+    const dict = _getIPToVMDict(xapi, xosansr)
+    const brickVMs = map(bricks, b => dict[b])
+    const replicaPart = data.type === 'replica_arbiter' || data.type === 'replica' ? `replica ${data.nodes.length - bricks.length}` : ''
+    await glusterCmd(glusterEndpoint, `volume remove-brick xosan ${replicaPart} ${bricks.join(' ')} force`)
+    remove(data.nodes, node => ips.includes(node.vm.ip))
+    await xapi.xo.setData(xosansr, 'xosan_config', data)
+    await asyncMap(brickVMs, vm => xapi.deleteVm(vm.vm, true))
+  } finally {
+    delete CURRENTLY_CREATING_SRS[xapi.pool.$id]
+  }
+})
+
+removeBricks.description = 'remove brick from XOSAN SR'
+removeBricks.permission = 'admin'
+removeBricks.params = {
+  xosansr: { type: 'string' },
+  bricks: {
+    type: 'array',
+    items: { type: 'string' }
+  }
 }
 
 export function checkSrIsBusy ({ poolId }) {
@@ -566,7 +643,7 @@ POSSIBLE_CONFIGURATIONS[2] = [{ layout: 'replica_arbiter', redundancy: 3, capaci
 POSSIBLE_CONFIGURATIONS[3] = [
   { layout: 'disperse', redundancy: 1, capacity: 2 },
   { layout: 'replica', redundancy: 3, capacity: 1 }]
-POSSIBLE_CONFIGURATIONS[4] = [{ layout: 'replica', redundancy: 2, capacity: 1 }]
+POSSIBLE_CONFIGURATIONS[4] = [{ layout: 'replica', redundancy: 2, capacity: 2 }]
 POSSIBLE_CONFIGURATIONS[5] = [{ layout: 'disperse', redundancy: 1, capacity: 4 }]
 POSSIBLE_CONFIGURATIONS[6] = [
   { layout: 'disperse', redundancy: 2, capacity: 4 },
@@ -603,8 +680,9 @@ export async function computeXosanPossibleOptions ({ lvmSrs }) {
     const xapi = this.getXapi(lvmSrs[0])
     const srs = map(lvmSrs, srId => xapi.getObject(srId))
     const srSizes = map(srs, sr => sr.physical_size - sr.physical_utilisation)
-    const minSize = Math.min.apply(null, srSizes)
-    const brickSize = (minSize - XOSAN_VM_SYSTEM_DISK_SIZE) * XOSAN_DATA_DISK_USEAGE_RATIO
+    // TODO remove MAX_DISK_SIZE limitation. it's just used during the beta
+    const minSize = Math.min.apply(null, srSizes.concat(MAX_DISK_SIZE))
+    const brickSize = Math.floor((minSize - XOSAN_VM_SYSTEM_DISK_SIZE) * XOSAN_DATA_DISK_USEAGE_RATIO)
     return configurations.map(conf => ({ ...conf, availableSpace: brickSize * conf.capacity }))
   }
 }

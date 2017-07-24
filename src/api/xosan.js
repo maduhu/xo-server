@@ -572,7 +572,7 @@ export const addBricks = defer.onFailure(async function ($onFailure, { xosansr, 
       const brickName = _getBrickName(ipAddress)
       newNodes.push({ brickName, host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: ipAddress }, underlyingSr: newSr })
     }
-    const replicaPart =  data.type === 'replica_arbiter' ? `replica ${data.nodes.length + lvmsrs.length}` : ''
+    const replicaPart = data.type === 'replica_arbiter' ? `replica ${data.nodes.length + lvmsrs.length}` : ''
     await glusterCmd(glusterEndpoint, `volume add-brick xosan ${replicaPart} ${newNodes.map(n => n.brickName).join(' ')}`)
     data.nodes = data.nodes.concat(newNodes)
     await xapi.xo.setData(xosansr, 'xosan_config', data)

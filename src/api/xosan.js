@@ -232,7 +232,7 @@ async function getOrCreateSshKey (xapi) {
   return sshKey
 }
 
-const _probePoolAndWaitForPresence = defer.onFailure(async function($onFailure,glusterEndpoint, addresses) {
+const _probePoolAndWaitForPresence = defer.onFailure(async function ($onFailure, glusterEndpoint, addresses) {
   await asyncMap(addresses, async (address) => {
     await glusterCmd(glusterEndpoint, 'peer probe ' + address)
     $onFailure(() => glusterCmd(glusterEndpoint, 'peer detach ' + address, true))
@@ -531,7 +531,7 @@ function _findIPAddressOutsideList (reservedList) {
   return null
 }
 
-const insertNewGlusterVm = defer.onFailure(async function($onFailure, xapi, xosansr, lvmsrId, {labelSuffix = '', glusterEndpoint = null, ipAddress = null,
+const insertNewGlusterVm = defer.onFailure(async function ($onFailure, xapi, xosansr, lvmsrId, {labelSuffix = '', glusterEndpoint = null, ipAddress = null,
   increaseDataDisk = true, maxDiskSize = Infinity}) {
   const data = xapi.xo.getData(xosansr, 'xosan_config')
   if (ipAddress === null) {
@@ -572,7 +572,7 @@ export const addBricks = defer.onFailure(async function ($onFailure, { xosansr, 
       const brickName = _getBrickName(ipAddress)
       newNodes.push({ brickName, host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: ipAddress }, underlyingSr: newSr })
     }
-    const replicaPart = data.type === 'replica_arbiter' || data.type === 'replica' ? `replica ${data.nodes.length + lvmsrs.length}` : ''
+    const replicaPart =  data.type === 'replica_arbiter' ? `replica ${data.nodes.length + lvmsrs.length}` : ''
     await glusterCmd(glusterEndpoint, `volume add-brick xosan ${replicaPart} ${newNodes.map(n => n.brickName).join(' ')}`)
     data.nodes = data.nodes.concat(newNodes)
     await xapi.xo.setData(xosansr, 'xosan_config', data)
@@ -614,9 +614,11 @@ export const removeBricks = defer.onFailure(async function ($onFailure, { xosans
   CURRENTLY_CREATING_SRS[xapi.pool.$id] = true
   try {
     const data = xapi.xo.getData(xosansr, 'xosan_config')
-    //IPV6
+    // IPV6
     const ips = map(bricks, b => b.split(':')[0])
     const glusterEndpoint = this::_getGlusterEndpoint(xosansr)
+    // "peer detach" doesn't allow removal of locahost
+    remove(glusterEndpoint.addresses, ip => ips.includes(ip))
     const dict = _getIPToVMDict(xapi, xosansr)
     const brickVMs = map(bricks, b => dict[b])
     const replicaPart = data.type === 'replica_arbiter' || data.type === 'replica' ? `replica ${data.nodes.length - bricks.length}` : ''

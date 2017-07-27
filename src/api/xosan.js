@@ -377,7 +377,7 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
       redundancy
     })
     await xapi.call('SR.scan', xosanSrRef)
-    //TODO: delete me, this is just for development.
+    // TODO: delete me, this is just for development.
     await this::testSR({sr: xosanSrRef})
   } finally {
     delete CURRENTLY_CREATING_SRS[xapi.pool.$id]

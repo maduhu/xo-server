@@ -356,9 +356,9 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
     await configureGluster(redundancy, ipAndHosts, glusterEndpoint, glusterType, arbiter)
     debug('xosan gluster volume started')
     const config = { server: ipAndHosts[0].address + ':/xosan', backupserver: ipAndHosts[1].address }
-    const xosanSr = await xapi.call('SR.create', firstSr.$PBDs[0].$host.$ref, config, 0, 'XOSAN', 'XOSAN', 'xosan', '', true, {})
+    const xosanSrRef = await xapi.call('SR.create', firstSr.$PBDs[0].$host.$ref, config, 0, 'XOSAN', 'XOSAN', 'xosan', '', true, {})
     // we just forget because the cleanup actions are stacked in the $onFailure system
-    $onFailure(() => xapi.forgetSr(xosanSr))
+    $onFailure(() => xapi.forgetSr(xosanSrRef))
     if (arbiter) {
       ipAndHosts.push(arbiter)
     }
@@ -369,14 +369,16 @@ export const createSR = defer.onFailure(async function ($onFailure, { template, 
       underlyingSr: param.underlyingSr.$id,
       arbiter: !!param['arbiter']
     }))
-    await xapi.xo.setData(xosanSr, 'xosan_config', {
+    await xapi.xo.setData(xosanSrRef, 'xosan_config', {
       nodes: nodes,
       template: template,
       network: xosanNetwork.$id,
       type: glusterType,
       redundancy
     })
-    await this::testSR({sr: xosanSr})
+    await xapi.call('SR.scan', xosanSrRef)
+    //TODO: delete me, this is just for development.
+    await this::testSR({sr: xosanSrRef})
   } finally {
     delete CURRENTLY_CREATING_SRS[xapi.pool.$id]
   }
@@ -441,6 +443,7 @@ export async function replaceBrick ({ xosansr, previousBrick, newLvmSr }) {
   if (previousVMEntry) {
     await xapi.deleteVm(previousVMEntry.vm, true)
   }
+  await xapi.call('SR.scan', xapi.getObject(xosansr).$ref)
 }
 
 replaceBrick.description = 'replaceBrick brick in gluster volume'
@@ -587,6 +590,7 @@ export const addBricks = defer.onFailure(async function ($onFailure, {xosansr, l
     await glusterCmd(glusterEndpoint, `volume add-brick xosan ${newNodes.map(n => n.brickName).join(' ')}`)
     data.nodes = data.nodes.concat(newNodes)
     await xapi.xo.setData(xosansr, 'xosan_config', data)
+    await xapi.call('SR.scan', xapi.getObject(xosansr).$ref)
   } finally {
     delete CURRENTLY_CREATING_SRS[xapi.pool.$id]
   }

@@ -550,7 +550,7 @@ const insertNewGlusterVm = defer.onFailure(async function ($onFailure, xapi, xos
   return { data, newVM, addressAndHost, glusterEndpoint }
 })
 
-export const addBricks = defer.onFailure(async function ($onFailure, { xosansr, lvmsrs }) {
+export const addBricks = defer.onFailure(async function ($onFailure, {xosansr, lvmsrs}) {
   const xapi = this.getXapi(xosansr)
   if (CURRENTLY_CREATING_SRS[xapi.pool.$id]) {
     throw new Error('createSR is already running for this pool')
@@ -566,25 +566,27 @@ export const addBricks = defer.onFailure(async function ($onFailure, { xosansr, 
       const ipAddress = _findIPAddressOutsideList(usedAddresses.concat(newAddresses))
       newAddresses.push(ipAddress)
       // TODO remove MAX_DISK_SIZE limitation. it's just used during the beta
-      const { newVM, addressAndHost } = await this::insertNewGlusterVm(xapi, xosansr, newSr, {ipAddress, maxDiskSize: MAX_DISK_SIZE})
+      const {newVM, addressAndHost} = await this::insertNewGlusterVm(xapi, xosansr, newSr, {
+        ipAddress,
+        maxDiskSize: MAX_DISK_SIZE
+      })
       $onFailure(() => glusterCmd(glusterEndpoint, 'peer detach ' + ipAddress, true))
       $onFailure(() => xapi.deleteVm(newVM, true))
       const brickName = _getBrickName(ipAddress)
-      newNodes.push({ brickName, host: addressAndHost.host.$id, vm: { id: newVM.$id, ip: ipAddress }, underlyingSr: newSr })
+      newNodes.push({brickName, host: addressAndHost.host.$id, vm: {id: newVM.$id, ip: ipAddress}, underlyingSr: newSr})
     }
-    const replicaPart = data.type === 'replica_arbiter' ? `replica ${data.nodes.length + lvmsrs.length}` : ''
-    await glusterCmd(glusterEndpoint, `volume add-brick xosan ${replicaPart} ${newNodes.map(n => n.brickName).join(' ')}`)
-    data.nodes = data.nodes.concat(newNodes)
-    await xapi.xo.setData(xosansr, 'xosan_config', data)
     const arbiterNode = data.nodes.find(n => n['arbiter'])
     if (arbiterNode) {
       await glusterCmd(glusterEndpoint, `volume remove-brick xosan replica ${data.nodes.length - 1} ${_getBrickName(arbiterNode.vm.ip)} force`)
-      await glusterCmd(glusterEndpoint, 'peer detach ' + arbiterNode.vm.ip, true)
-      await xapi.deleteVm(arbiterNode.vm.id, true)
       data.nodes = data.nodes.filter(n => n !== arbiterNode)
       data.type = 'replica'
       await xapi.xo.setData(xosansr, 'xosan_config', data)
+      await glusterCmd(glusterEndpoint, 'peer detach ' + arbiterNode.vm.ip, true)
+      await xapi.deleteVm(arbiterNode.vm.id, true)
     }
+    await glusterCmd(glusterEndpoint, `volume add-brick xosan ${newNodes.map(n => n.brickName).join(' ')}`)
+    data.nodes = data.nodes.concat(newNodes)
+    await xapi.xo.setData(xosansr, 'xosan_config', data)
   } finally {
     delete CURRENTLY_CREATING_SRS[xapi.pool.$id]
   }

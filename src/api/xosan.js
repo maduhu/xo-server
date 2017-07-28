@@ -627,11 +627,11 @@ export const removeBricks = defer.onFailure(async function ($onFailure, { xosans
     remove(glusterEndpoint.addresses, ip => ips.includes(ip))
     const dict = _getIPToVMDict(xapi, xosansr)
     const brickVMs = map(bricks, b => dict[b])
-    const replicaPart = data.type === 'replica_arbiter' || data.type === 'replica' ? `replica ${data.nodes.length - bricks.length}` : ''
-    await glusterCmd(glusterEndpoint, `volume remove-brick xosan ${replicaPart} ${bricks.join(' ')} force`)
+    await glusterCmd(glusterEndpoint, `volume remove-brick xosan ${bricks.join(' ')} force`)
     await asyncMap(ips, ip => glusterCmd(glusterEndpoint, 'peer detach ' + ip, true))
     remove(data.nodes, node => ips.includes(node.vm.ip))
     await xapi.xo.setData(xosansr, 'xosan_config', data)
+    await xapi.call('SR.scan', xapi.getObject(xosansr).$ref)
     await asyncMap(brickVMs, vm => xapi.deleteVm(vm.vm, true))
   } finally {
     delete CURRENTLY_CREATING_SRS[xapi.pool.$id]
